@@ -1,8 +1,13 @@
 // Elefante — parse-business-card edge function
 //
-// Receives raw OCR text extracted client-side from a business card image (Tesseract.js).
-// Sends ONLY the text to the Anthropic API — the image is never transmitted.
-// Returns cleaned, validated, structured contact fields for the user to review.
+// Hybrid deterministic + AI extraction pipeline:
+//
+//   rawText
+//     → deterministicExtract()   regex/rules — emails, phones, legal entities, roles, domains
+//     → buildPrompt()            both raw text AND candidates are sent to the model
+//     → Claude                  anchored to candidates; fills name/city from raw text
+//     → postProcess()            cleanup + email reconstruction using the AI-identified name
+//     → if AI fails → deterministicFallback() returns extracted candidates directly
 //
 // Deploy:  supabase functions deploy parse-business-card
 // Secret:  supabase secrets set ANTHROPIC_API_KEY=sk-ant-...
@@ -13,156 +18,411 @@ const CORS = {
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 }
 
-// ── System prompt ──────────────────────────────────────────────────────────────
-// Detailed rules to counteract the most common OCR/parsing failure modes.
-// Structured by field, with explicit rejection rules and confidence guidance.
-
-const SYSTEM_PROMPT = `\
-You extract structured contact information from business card OCR text.
-The text may contain OCR errors, noise, and label prefixes — be tolerant but never inventive.
-
-OUTPUT FORMAT
-Return ONLY a valid JSON object. No markdown, no explanation, nothing else.
-Omit any field you cannot identify with high confidence. It is always better to omit a field than to return a fragment or a wrong value.
-
-FIELD RULES
-
-name
-- The person's full human name (first name + last name).
-- Usually prominent near the top of the card.
-- Typically 2–4 words, title case, no digits or symbols.
-- NEVER use a company name, domain, URL, email address, or job title as the name.
-- If you cannot find a clear human name, omit this field.
-
-role
-- The person's job title or position.
-- Often directly below the name.
-- Examples: "Managing Director", "Sales Manager", "Head of Engineering".
-- NEVER use a label like "Tel:", "Fax:", "Telefono:", "Mobile:" as a role.
-- If uncertain, omit.
-
-company
-- The organisation's name.
-- MUST be at least 3 characters long.
-- MUST consist primarily of letters — not digits, hyphens, pipes, or punctuation fragments.
-- PRIORITY: prefer lines containing legal entity identifiers: S.L., S.A., Ltd, GmbH, Inc, Corp, AG, SAS, BV, NV, LLC.
-- HINT: the email domain often implies the company name. For example, domain "muepro.es" likely belongs to "MÜPRO" or "MUPRO Hispania S.L." — look for a matching word in the OCR text.
-- NEVER use a phone number, fax number, URL, email address, or postal address as the company.
-- NEVER use lines that start with any of these label prefixes (case-insensitive):
-    Fax, Tel, Telefono, Teléfono, Telefon, Phone, Mobile, Móvil, Movil, Handy,
-    E-Mail, Email, Web, www, http
-- NEVER return fragments like "- Fy", "| Co", or any string that starts with a symbol or is fewer than 3 real letters.
-- If no confident company name is found, omit this field.
-
-email
-- A valid email address (local@domain.tld).
-- Lowercase the entire address.
-- OCR often drops leading characters from the local part. If you have both a name and an email, check for truncation: for example, if the name is "Alvaro Imaz" and the email reads "varo.imaz@domain.com", the OCR likely dropped "al" — reconstruct the full email as "alvaro.imaz@domain.com".
-- Preserve the domain exactly as OCR provided it.
-
-phone
-- A phone number with at least 7 digits.
-- PREFER numbers labelled "Mobile", "Móvil", "Handy", or without any label, over numbers labelled "Fax".
-- If a line is clearly labelled "Fax:", do NOT use it as the phone number unless it is the only number present.
-- Include country code (e.g. +34, +49) if present.
-
-city
-- A city or location explicitly stated on the card.
-- Omit if not clearly present.
-
-GENERAL RULES
-- Strip leading/trailing symbols from all values (hyphens, pipes, backslashes, colons).
-- Normalise internal whitespace (collapse multiple spaces).
-- When in doubt, omit the field. A missing field is better than a wrong one.
-- NEVER hallucinate values not present in the OCR text.`
-
 // ── Types ──────────────────────────────────────────────────────────────────────
 
+type PhoneLabel = 'mobile' | 'direct' | 'tel' | 'none' | 'fax'
+
+interface PhoneCandidate {
+  number: string
+  label: PhoneLabel
+  priority: number   // lower = better; fax = 99
+}
+
+interface DeterministicCandidates {
+  emails:        string[]
+  phones:        PhoneCandidate[]    // sorted best-first
+  legalEntities: string[]
+  roles:         string[]
+  nameCandidates:string[]
+  domains:       string[]
+}
+
 interface ParsedFields {
-  name?: string
-  email?: string
-  phone?: string
+  name?:    string
+  email?:   string
+  phone?:   string
   company?: string
-  role?: string
-  city?: string
+  role?:    string
+  city?:    string
 }
 
-const ALLOWED_FIELDS = ['name', 'email', 'phone', 'company', 'role', 'city'] as const
-type AllowedField = typeof ALLOWED_FIELDS[number]
+// ── Constants ──────────────────────────────────────────────────────────────────
 
-// ── Post-processing ────────────────────────────────────────────────────────────
-// Second line of defence after the AI response.
-// Applies deterministic cleanup and rejection rules that are hard to express
-// reliably in natural language.
-
-// Remove leading/trailing noise characters the AI might have missed
-function stripSymbols(value: string): string {
-  return value
-    .replace(/^[\s\-|\\\/,:;.'"`]+/, '')   // leading symbols
-    .replace(/[\s\-|\\\/,:;.'"`]+$/, '')   // trailing symbols
-    .replace(/\s{2,}/g, ' ')              // collapse internal whitespace
-    .trim()
+const PHONE_PRIORITY: Record<PhoneLabel, number> = {
+  mobile: 1, direct: 2, none: 3, tel: 4, fax: 99,
 }
 
-// Reject obviously invalid company names
+// Legal entity suffixes common in Europe + Americas
+const LEGAL_ENTITY_RE =
+  /\b(S\.L\.?|SL|S\.A\.?|SA|GmbH|Ltd\.?|Inc\.?|S\.A\.S\.?|SAS|LLC|L\.L\.C\.?|B\.V\.?|BV|N\.V\.?|NV|Corp\.?|A\.G\.?|AG|K\.G\.?|KG|OHG|SpA|SARL|S\.R\.L\.?|SRL|PLC|AB|AS|OY|A\/S)\b/
+
+// Role/title keywords — multilingual, used for line scoring
+const ROLE_RE = /\b(
+  director\s+general|managing\s+director|general\s+manager|gerente\s+general|
+  director|ceo|cto|cfo|coo|cso|chro|cpo|
+  founder|co-?founder|cofundador|
+  partner|socio|
+  manager|gerente|responsable|
+  comercial|account\s+executive|
+  sales|ventas|
+  engineer|ingeniero|
+  project\s+manager|
+  business\s+development|
+  analyst|analista|
+  consultant|consultor|
+  architect|arquitecto|
+  head\s+of|jefe\s+de|
+  president|presidente|
+  vice\s+president|vicepresidente|
+  executive|ejecutivo|
+  specialist|especialista
+)\b/ix
+
+// Label prefixes that can never be company or role
+const LABEL_PREFIX_RE =
+  /^(fax|tel[eé]?[f]?|telef[oó]no|phone|mob[il]+|m[oó]vil|handy|e-?mail|web|www|http|nif|vat|c\.?c\.?|@)/i
+
+// Bad-prefix set used in company validation (subset of LABEL_PREFIX_RE for company)
+const COMPANY_BAD_PREFIXES = [
+  'fax', 'tel:', 'tel.', 'telefon', 'mobile', 'movil', 'móvil',
+  'handy', 'e-mail', 'email', 'www', 'http',
+]
+
+// ── Deterministic extractors ───────────────────────────────────────────────────
+
+function extractEmails(text: string): string[] {
+  const re = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g
+  const found = new Set<string>()
+  for (const m of text.matchAll(re)) found.add(m[0].toLowerCase())
+  return Array.from(found)
+}
+
+function extractPhones(lines: string[]): PhoneCandidate[] {
+  // Matches international and local formats; requires 7–15 digits
+  const PHONE_RE = /(?:\+?\d[\d\s\-().]{5,17}\d)/g
+  const results: PhoneCandidate[] = []
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    const matches = line.match(PHONE_RE)
+    if (!matches) continue
+
+    // Check label on current line AND previous line (some cards put label above)
+    const ctx = ((i > 0 ? lines[i - 1] : '') + ' ' + line).toLowerCase()
+
+    let label: PhoneLabel
+    if (/m[oó]vil|mobile|cell(?:ular)?|handy/i.test(ctx)) {
+      label = 'mobile'
+    } else if (/directo?\b|direct\b/i.test(ctx)) {
+      label = 'direct'
+    } else if (/fax/i.test(ctx)) {
+      label = 'fax'
+    } else if (/tel[eé]?f?(?:ono|on)?\.?|phone|tel\b/i.test(ctx)) {
+      label = 'tel'
+    } else {
+      label = 'none'
+    }
+
+    for (const raw of matches) {
+      const number = raw.replace(/\s{2,}/g, ' ').trim()
+      const digitCount = (number.match(/\d/g) ?? []).length
+      if (digitCount >= 7 && digitCount <= 15) {
+        results.push({ number, label, priority: PHONE_PRIORITY[label] })
+      }
+    }
+  }
+
+  // Sort best-first; deduplicate by number string
+  const seen = new Set<string>()
+  return results
+    .sort((a, b) => a.priority - b.priority)
+    .filter(p => { if (seen.has(p.number)) return false; seen.add(p.number); return true })
+}
+
 function isValidCompany(value: string): boolean {
   if (value.length < 3) return false
-  // Must have at least 2 actual letters
-  const letterCount = (value.match(/[a-zA-ZÀ-ÖØ-öø-ÿ]/g) ?? []).length
-  if (letterCount < 2) return false
-  // Reject if it starts with a label prefix (case-insensitive)
+  const letters = (value.match(/[a-zA-ZÀ-ÖØ-öø-ÿ]/g) ?? []).length
+  if (letters < 2) return false
+  if (letters / value.length < 0.35) return false
   const lower = value.toLowerCase()
-  const badPrefixes = [
-    'fax', 'tel:', 'tel.', 'telefon', 'mobile', 'movil', 'móvil',
-    'handy', 'e-mail', 'email', 'www', 'http',
-  ]
-  if (badPrefixes.some(p => lower.startsWith(p))) return false
-  // Reject strings that are mostly non-letter characters
-  if (letterCount / value.length < 0.4) return false
+  if (COMPANY_BAD_PREFIXES.some(p => lower.startsWith(p))) return false
   return true
 }
 
-// Try to infer a company fallback from the email domain when the AI returned nothing
-function inferCompanyFromEmail(email: string): string | undefined {
+function extractLegalEntities(lines: string[]): string[] {
+  return lines.filter(line =>
+    LEGAL_ENTITY_RE.test(line) &&
+    isValidCompany(line) &&
+    line.length <= 120 &&
+    !LABEL_PREFIX_RE.test(line)
+  )
+}
+
+function extractRoles(lines: string[]): string[] {
+  return lines.filter(line =>
+    ROLE_RE.test(line) &&
+    line.length < 80 &&
+    !LABEL_PREFIX_RE.test(line) &&
+    !/\d{5,}/.test(line)          // reject lines that are mostly numbers
+  )
+}
+
+// Extract name candidates: 2–4 title-case words, no digits, no label prefixes
+function extractNameCandidates(lines: string[]): string[] {
+  const NAME_RE = /^[A-ZÁÉÍÓÚÜÑÀÈÌÒÙÂÊÎÔÛÄËÏÖÜ][a-záéíóúüñàèìòùâêîôûäëïöü\-]+(?:\s[A-ZÁÉÍÓÚÜÑÀÈÌÒÙÂÊÎÔÛÄËÏÖÜ][a-záéíóúüñàèìòùâêîôûäëïöü\-]+){1,3}$/
+
+  return lines.filter(line => {
+    const words = line.trim().split(/\s+/)
+    return (
+      NAME_RE.test(line.trim()) &&
+      !LABEL_PREFIX_RE.test(line) &&
+      !LEGAL_ENTITY_RE.test(line) &&
+      !ROLE_RE.test(line) &&
+      !/\d/.test(line) &&
+      !line.includes('@') &&
+      words.length >= 2 &&
+      words.length <= 4
+    )
+  })
+}
+
+function extractDomains(text: string): string[] {
+  const re = /(?:https?:\/\/)?(?:www\.)?([a-zA-Z0-9-]{2,}\.[a-zA-Z]{2,}(?:\.[a-zA-Z]{2,})?)/g
+  const found = new Set<string>()
+  for (const m of text.matchAll(re)) {
+    const d = m[1].toLowerCase()
+    // Exclude common TLDs that aren't company domains
+    if (!['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com'].includes(d)) {
+      found.add(d)
+    }
+  }
+  return Array.from(found)
+}
+
+function deterministicExtract(rawText: string): DeterministicCandidates {
+  const lines = rawText.split('\n').map(l => l.trim()).filter(l => l.length > 0)
+  return {
+    emails:         extractEmails(rawText),
+    phones:         extractPhones(lines),
+    legalEntities:  extractLegalEntities(lines),
+    roles:          extractRoles(lines),
+    nameCandidates: extractNameCandidates(lines),
+    domains:        extractDomains(rawText),
+  }
+}
+
+// ── AI prompt ─────────────────────────────────────────────────────────────────
+// AI's job is narrow: choose among candidates, fill name/city from raw text,
+// and reconstruct truncated emails. It should NOT invent company names.
+
+const SYSTEM_PROMPT = `\
+You finalize business card contact extraction.
+
+You receive two inputs:
+1. CANDIDATES — pre-extracted deterministic results (high reliability)
+2. RAW OCR TEXT — may contain noise and errors
+
+Your task is to return ONLY a valid JSON object with these fields (omit uncertain ones):
+  name, email, phone, company, role, city
+
+FIELD INSTRUCTIONS
+
+email
+• Use the first candidate email if present.
+• If the email local part appears truncated relative to the person's name
+  (e.g. name "Alvaro Imaz" but email starts "varo.imaz@..."), reconstruct the full email.
+• Lowercase. Preserve domain exactly.
+
+phone
+• Use the first phone candidate (mobile/direct are preferred; fax is last resort).
+• Include country code if present.
+
+company
+• Use the legal entity line if one is listed in candidates.
+• Otherwise, look in the raw OCR text for the organisation name near the top.
+• If an email domain matches a word in the raw text, that word is likely the company.
+• Never use a phone number, fax, address, URL, or label row as the company name.
+• Never return fragments shorter than 3 meaningful letters.
+
+role
+• Use the first role candidate if present.
+• Otherwise look in raw OCR text directly below the person's name.
+
+name
+• Find the person's full human name from the raw OCR text.
+• Usually 2–4 words in title case, no digits, not a company or label.
+• If a name candidate is listed, prefer it.
+
+city
+• Include only if clearly stated. Omit if uncertain.
+
+RULES
+• Never invent values. When uncertain, omit.
+• Return ONLY the JSON object — no markdown, no explanation.`
+
+function buildPrompt(rawText: string, c: DeterministicCandidates): string {
+  const lines: string[] = ['=== CANDIDATES ===']
+
+  if (c.emails.length)
+    lines.push(`Emails: ${c.emails.join(', ')}`)
+
+  if (c.phones.length) {
+    const ps = c.phones.map(p => p.label !== 'none' ? `${p.number} (${p.label})` : p.number)
+    lines.push(`Phones (best first): ${ps.join(' | ')}`)
+  }
+
+  if (c.legalEntities.length)
+    lines.push(`Legal entity lines: ${c.legalEntities.join(' | ')}`)
+
+  if (c.roles.length)
+    lines.push(`Role/title lines: ${c.roles.slice(0, 3).join(' | ')}`)
+
+  if (c.nameCandidates.length)
+    lines.push(`Name candidates: ${c.nameCandidates.slice(0, 3).join(' | ')}`)
+
+  if (c.domains.length)
+    lines.push(`Domains: ${c.domains.join(', ')}`)
+
+  lines.push('\n=== RAW OCR TEXT ===')
+  lines.push(rawText)
+
+  return lines.join('\n')
+}
+
+// ── Post-processing ────────────────────────────────────────────────────────────
+
+function stripSymbols(value: string): string {
+  return value
+    .replace(/^[\s\-|\\\/,:;.'"`]+/, '')
+    .replace(/[\s\-|\\\/,:;.'"`]+$/, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim()
+}
+
+// Try to fix OCR-truncated email local parts using the identified name.
+// Example: name="Alvaro Imaz", email="varo.imaz@muepro.es" → "alvaro.imaz@muepro.es"
+// Only reconstructs when the dropped prefix is ≤ 4 chars (conservative).
+function tryReconstructEmail(email: string, name: string | undefined): string {
+  if (!name || !email.includes('@')) return email
+
+  const atIdx = email.indexOf('@')
+  const local = email.slice(0, atIdx).toLowerCase()
+  const domain = email.slice(atIdx)                   // includes '@'
+
+  const parts = name.toLowerCase()
+    .replace(/[^a-záéíóúüñàèìòùâêîôûäëïöü\s]/gi, '')
+    .trim()
+    .split(/\s+/)
+    .filter(p => p.length > 1)
+
+  if (parts.length < 2) return email
+
+  const first = parts[0]
+  const last = parts[parts.length - 1]
+
+  // Common name-to-email patterns
+  const patterns = [
+    `${first}.${last}`,
+    `${first[0]}.${last}`,
+    `${first}${last}`,
+    `${last}.${first}`,
+  ]
+
+  for (const pattern of patterns) {
+    if (pattern.length > local.length && pattern.endsWith(local)) {
+      const dropped = pattern.slice(0, pattern.length - local.length)
+      if (dropped.length >= 1 && dropped.length <= 4) {
+        return pattern + domain      // reconstruct
+      }
+    }
+  }
+
+  return email
+}
+
+// Infer company fallback from email domain — used only when no legal entity found
+function inferCompanyFromDomain(email: string): string | undefined {
   const match = email.match(/@([a-zA-Z0-9-]+)(?:\.[a-zA-Z]{2,})+$/)
   if (!match) return undefined
-  const domainPart = match[1] // e.g. "muepro" from "muepro.es"
-  // Only use as fallback if it looks like a real company word (≥ 4 chars, all letters)
-  if (domainPart.length >= 4 && /^[a-zA-Z]+$/.test(domainPart)) {
-    return domainPart.charAt(0).toUpperCase() + domainPart.slice(1)
+  const part = match[1]
+  if (part.length >= 3 && /^[a-zA-Z]+$/.test(part)) {
+    return part.charAt(0).toUpperCase() + part.slice(1)
   }
   return undefined
 }
 
-function postProcess(raw: Record<string, unknown>): ParsedFields {
+const ALLOWED_FIELDS = ['name', 'email', 'phone', 'company', 'role', 'city'] as const
+
+function postProcess(
+  raw: Record<string, unknown>,
+  candidates: DeterministicCandidates,
+): ParsedFields {
   const result: ParsedFields = {}
 
   for (const key of ALLOWED_FIELDS) {
     const val = raw[key]
     if (typeof val !== 'string') continue
 
-    let cleaned = stripSymbols(val)
-    if (!cleaned) continue
+    let v = stripSymbols(val)
+    if (!v) continue
 
     if (key === 'email') {
-      cleaned = cleaned.toLowerCase()
-      // Basic format check — must have exactly one @ and a dot after it
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleaned)) continue
+      v = v.toLowerCase()
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v)) continue
     }
 
-    if (key === 'company') {
-      if (!isValidCompany(cleaned)) continue
+    if (key === 'company' && !isValidCompany(v)) continue
+
+    result[key] = v
+  }
+
+  // Email reconstruction: apply if the AI didn't fix the truncation itself
+  if (result.email) {
+    result.email = tryReconstructEmail(result.email, result.name)
+  }
+
+  // Company fallback: legal entity candidate → domain inference
+  if (!result.company) {
+    if (candidates.legalEntities.length > 0) {
+      result.company = candidates.legalEntities[0]
+    } else if (result.email) {
+      const inferred = inferCompanyFromDomain(result.email)
+      if (inferred) result.company = inferred
     }
-
-    result[key as AllowedField] = cleaned
   }
 
-  // Domain-based company fallback: if company is still missing but email is present,
-  // use the email domain as a minimal hint (better than nothing / "- Fy")
-  if (!result.company && result.email) {
-    const inferred = inferCompanyFromEmail(result.email)
-    if (inferred) result.company = inferred
+  // Phone fallback: if AI omitted phone but we have a candidate
+  if (!result.phone && candidates.phones.length > 0) {
+    const best = candidates.phones.find(p => p.label !== 'fax') ?? candidates.phones[0]
+    result.phone = best.number
   }
+
+  // Email fallback: if AI omitted email but deterministic found one
+  if (!result.email && candidates.emails.length > 0) {
+    const reconstructed = tryReconstructEmail(candidates.emails[0], result.name)
+    result.email = reconstructed
+  }
+
+  return result
+}
+
+// Deterministic-only fallback used when AI call fails entirely
+function deterministicFallback(candidates: DeterministicCandidates): ParsedFields {
+  const result: ParsedFields = {}
+
+  if (candidates.emails.length > 0) result.email = candidates.emails[0]
+
+  const bestPhone = candidates.phones.find(p => p.label !== 'fax') ?? candidates.phones[0]
+  if (bestPhone) result.phone = bestPhone.number
+
+  if (candidates.legalEntities.length > 0) {
+    result.company = candidates.legalEntities[0]
+  } else if (result.email) {
+    result.company = inferCompanyFromDomain(result.email)
+  }
+
+  if (candidates.roles.length > 0) result.role = candidates.roles[0]
+  if (candidates.nameCandidates.length > 0) result.name = candidates.nameCandidates[0]
 
   return result
 }
@@ -170,44 +430,42 @@ function postProcess(raw: Record<string, unknown>): ParsedFields {
 // ── Edge function ──────────────────────────────────────────────────────────────
 
 Deno.serve(async (req: Request) => {
-  if (req.method === 'OPTIONS') {
-    return new Response('ok', { headers: CORS })
-  }
-
-  if (req.method !== 'POST') {
-    return respond({ error: 'Method not allowed' }, 405)
-  }
+  if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS })
+  if (req.method !== 'POST')   return respond({ error: 'Method not allowed' }, 405)
 
   const auth = req.headers.get('Authorization')
-  if (!auth?.startsWith('Bearer ')) {
-    return respond({ error: 'Unauthorized' }, 401)
-  }
+  if (!auth?.startsWith('Bearer ')) return respond({ error: 'Unauthorized' }, 401)
 
-  // Parse + validate input
   let rawText: string
   try {
     const body = await req.json() as { rawText?: unknown }
-    if (typeof body.rawText !== 'string' || !body.rawText.trim()) {
+    if (typeof body.rawText !== 'string' || !body.rawText.trim())
       return respond({ error: 'rawText must be a non-empty string' }, 400)
-    }
     rawText = body.rawText.trim().slice(0, 2000)
   } catch {
     return respond({ error: 'Invalid JSON body' }, 400)
   }
 
-  // Debug: log raw OCR input so failures can be diagnosed from Supabase logs
-  console.log('[parse-business-card] rawText:\n' + rawText)
+  // ── Step 1: deterministic extraction ──────────────────────────────────────
+  const candidates = deterministicExtract(rawText)
 
+  console.log('[parse-business-card] rawText:\n' + rawText)
+  console.log('[parse-business-card] candidates:', JSON.stringify(candidates))
+
+  // ── Step 2: AI refinement (optional — falls back to deterministic on error) ─
   const apiKey = Deno.env.get('ANTHROPIC_API_KEY')
   if (!apiKey) {
-    console.error('[parse-business-card] ANTHROPIC_API_KEY secret is not set')
-    return respond({ error: 'AI parsing is not configured on this deployment' }, 503)
+    console.warn('[parse-business-card] ANTHROPIC_API_KEY not set — using deterministic fallback')
+    const fallback = deterministicFallback(candidates)
+    console.log('[parse-business-card] fallback result:', JSON.stringify(fallback))
+    return respond(fallback, 200)
   }
 
-  // Call Anthropic API
-  let aiResponse: Response
+  let fields: ParsedFields
   try {
-    aiResponse = await fetch('https://api.anthropic.com/v1/messages', {
+    const prompt = buildPrompt(rawText, candidates)
+
+    const aiResp = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'x-api-key': apiKey,
@@ -216,46 +474,33 @@ Deno.serve(async (req: Request) => {
       },
       body: JSON.stringify({
         model: 'claude-3-5-haiku-20241022',
-        max_tokens: 300,
+        max_tokens: 400,
         system: SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: rawText }],
+        messages: [{ role: 'user', content: prompt }],
       }),
     })
-  } catch (err) {
-    console.error('[parse-business-card] Anthropic fetch error:', err)
-    return respond({ error: 'Failed to reach AI service' }, 502)
-  }
 
-  if (!aiResponse.ok) {
-    const errBody = await aiResponse.text()
-    console.error('[parse-business-card] Anthropic error:', aiResponse.status, errBody)
-    return respond({ error: 'AI service returned an error' }, 502)
-  }
+    if (!aiResp.ok) {
+      const errBody = await aiResp.text()
+      console.error('[parse-business-card] Anthropic error:', aiResp.status, errBody)
+      throw new Error('Anthropic API error')
+    }
 
-  // Extract JSON from AI response and post-process
-  let fields: ParsedFields
-  try {
-    const payload = await aiResponse.json() as { content?: { text: string }[] }
+    const payload = await aiResp.json() as { content?: { text: string }[] }
     const aiText = payload.content?.[0]?.text ?? ''
-
-    // Debug: log what the model returned before we touch it
-    console.log('[parse-business-card] AI raw response:', aiText)
+    console.log('[parse-business-card] AI response:', aiText)
 
     const match = aiText.match(/\{[\s\S]*\}/)
-    if (!match) throw new Error('No JSON object in AI response')
+    if (!match) throw new Error('No JSON in AI response')
 
     const raw = JSON.parse(match[0]) as Record<string, unknown>
-
-    // Apply post-processing: symbol stripping, validation, domain inference
-    fields = postProcess(raw)
+    fields = postProcess(raw, candidates)
   } catch (err) {
-    console.error('[parse-business-card] parse/process error:', err)
-    return respond({ error: 'Failed to parse AI response' }, 422)
+    console.error('[parse-business-card] AI step failed, using deterministic fallback:', err)
+    fields = deterministicFallback(candidates)
   }
 
-  // Debug: log the final cleaned result
-  console.log('[parse-business-card] final fields:', JSON.stringify(fields))
-
+  console.log('[parse-business-card] final result:', JSON.stringify(fields))
   return respond(fields, 200)
 })
 
