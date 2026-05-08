@@ -7,7 +7,10 @@
       "Bash(npm info *)",
       "Bash(npm view *)",
       "Bash(node -e \"const t = require\\('tesseract.js'\\); console.log\\(Object.keys\\(t\\)\\)\")",
-      "Bash(node -e \"const t = require\\('tesseract.js'\\); console.log\\(t.createWorker.toString\\(\\).slice\\(0,200\\)\\)\")"
+      "Bash(node -e \"const t = require\\('tesseract.js'\\); console.log\\(t.createWorker.toString\\(\\).slice\\(0,200\\)\\)\")",
+      "Bash(git rm *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }
