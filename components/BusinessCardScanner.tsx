@@ -10,12 +10,28 @@ export type BusinessCardScannerProps = {
 type Phase = 'idle' | 'warning' | 'processing' | 'review' | 'error'
 type ProcessingLabel = 'preprocessing' | 'loading' | 'reading' | 'parsing'
 
-// ── Image quality check ────────────────────────────────────────────────────────
-// Fast, lightweight check run before preprocessing and OCR.
-// Returns a warning string if the image is likely to produce bad results,
-// or null if quality looks acceptable.
+// ── Image analysis types ───────────────────────────────────────────────────────
 
-async function checkImageQuality(file: File): Promise<string | null> {
+// Crop region in original-image pixel coordinates
+interface CardBounds { x: number; y: number; w: number; h: number }
+
+interface ImageAnalysis {
+  warning: string | null   // non-null = show warning before proceeding
+  bounds:  CardBounds | null  // crop region to pass to preprocessForOCR; null = full image
+}
+
+// ── Image analysis ─────────────────────────────────────────────────────────────
+// Single-pass analysis at 200 px sample width. Returns a warning if the image
+// is too dark/blurry/small, and crop bounds for the detected card region.
+//
+// Algorithm (all in one pixel loop):
+//   1. Grayscale + brightness sum for darkness check
+//   2. Laplacian (|4c − n − s − e − w|) for blur detection
+//      variance of Laplacian: low → blurry, high → sharp
+//   3. Edge presence per row/column (|Laplacian| > threshold)
+//      → bounding box of edge-active region → crop + card-size ratio
+
+async function analyzeImage(file: File): Promise<ImageAnalysis> {
   return new Promise(resolve => {
     const img = new Image()
     const url = URL.createObjectURL(file)
@@ -23,43 +39,146 @@ async function checkImageQuality(file: File): Promise<string | null> {
     img.onload = () => {
       URL.revokeObjectURL(url)
 
-      // Minimum size: anything smaller than this is probably not a full card photo
+      // Hard minimum: anything this small is clearly not a proper card photo
       if (img.naturalWidth < 400 || img.naturalHeight < 250) {
-        resolve('The photo looks too small. Move closer so the card fills most of the frame.')
+        resolve({
+          warning: 'The photo looks too small. Move closer so the card fills most of the frame.',
+          bounds: null,
+        })
         return
       }
 
-      // Brightness check — sample the image at 200 px wide (fast on any device)
       try {
-        const sw = 200
-        const sh = Math.round(sw * img.naturalHeight / img.naturalWidth)
+        const SW = 200  // sample width; height is proportional
+        const SH = Math.max(1, Math.round(SW * img.naturalHeight / img.naturalWidth))
+
         const canvas = document.createElement('canvas')
-        canvas.width = sw
-        canvas.height = sh
+        canvas.width  = SW
+        canvas.height = SH
         const ctx = canvas.getContext('2d')
-        if (!ctx) { resolve(null); return }
-        ctx.drawImage(img, 0, 0, sw, sh)
-        const { data } = ctx.getImageData(0, 0, sw, sh)
-        let total = 0
-        const pixels = data.length / 4
-        for (let i = 0; i < data.length; i += 4) {
-          total += 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]
+        if (!ctx) { resolve({ warning: null, bounds: null }); return }
+        ctx.drawImage(img, 0, 0, SW, SH)
+        const { data } = ctx.getImageData(0, 0, SW, SH)
+
+        // ── Pass 1: grayscale + brightness sum ───────────────────────────────
+        const gray = new Uint8Array(SW * SH)
+        let brightnessSum = 0
+        for (let i = 0, j = 0; i < data.length; i += 4, j++) {
+          const g = (0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]) | 0
+          gray[j] = g
+          brightnessSum += g
         }
-        const avg = total / pixels
-        if (avg < 45) {
-          resolve('The photo looks too dark. Try in brighter light or near a window.')
+        const avgBrightness = brightnessSum / (SW * SH)
+        if (avgBrightness < 45) {
+          resolve({
+            warning: 'The photo looks too dark. Try in brighter light or near a window.',
+            bounds: null,
+          })
           return
         }
-      } catch {
-        // Quality check is best-effort — never block on a check failure
-      }
 
-      resolve(null)
+        // ── Pass 2: Laplacian — blur score + edge map ────────────────────────
+        // lap(x,y) = |4·c − n − s − e − w|  (clamped, inner pixels only)
+        //
+        // Variance of Laplacian: low → blurry (all values near zero),
+        //                        high → sharp (mix of large and small values)
+        //
+        // Row/column edge presence: count pixels where |lap| > EDGE_THR.
+        // If ≥ EDGE_FRAC of the row/column are edge-active, that row/col is "hot".
+        // Bounding box of hot rows/cols ≈ card extent.
+
+        const EDGE_THR  = 12    // Laplacian threshold to count as an edge pixel
+        const EDGE_FRAC = 0.04  // fraction of row/col that must be hot
+
+        const rowHot = new Uint8Array(SH)
+        const colHot = new Uint8Array(SW)
+
+        let lapSum = 0, lapSqSum = 0, lapCount = 0
+        const rowEdgeCount = new Int32Array(SH)
+        const colEdgeCount = new Int32Array(SW)
+
+        for (let y = 1; y < SH - 1; y++) {
+          for (let x = 1; x < SW - 1; x++) {
+            const c = gray[y * SW + x]
+            const lap = Math.abs(
+              4 * c
+              - gray[(y - 1) * SW + x]
+              - gray[(y + 1) * SW + x]
+              - gray[y * SW + (x - 1)]
+              - gray[y * SW + (x + 1)],
+            )
+            lapSum   += lap
+            lapSqSum += lap * lap
+            lapCount++
+            if (lap > EDGE_THR) {
+              rowEdgeCount[y]++
+              colEdgeCount[x]++
+            }
+          }
+        }
+
+        for (let y = 1; y < SH - 1; y++)
+          rowHot[y] = rowEdgeCount[y] > SW * EDGE_FRAC ? 1 : 0
+        for (let x = 1; x < SW - 1; x++)
+          colHot[x] = colEdgeCount[x] > SH * EDGE_FRAC ? 1 : 0
+
+        const lapMean     = lapSum / lapCount
+        const lapVariance = lapSqSum / lapCount - lapMean * lapMean
+
+        // ── Bounding box of hot rows/cols ────────────────────────────────────
+        let top = 0, bottom = SH - 1, left = 0, right = SW - 1
+        for (let y = 0; y < SH; y++)  if (rowHot[y]) { top    = y; break }
+        for (let y = SH - 1; y >= 0; y--) if (rowHot[y]) { bottom = y; break }
+        for (let x = 0; x < SW; x++)  if (colHot[x]) { left   = x; break }
+        for (let x = SW - 1; x >= 0; x--) if (colHot[x]) { right  = x; break }
+
+        const contentW = Math.max(1, right  - left)
+        const contentH = Math.max(1, bottom - top)
+        const cardRatio = (contentW * contentH) / (SW * SH)
+
+        // Card occupies less than 30 % of the image → too far away
+        if (cardRatio < 0.30) {
+          resolve({
+            warning: 'Move closer so the card fills more of the frame.',
+            bounds: null,
+          })
+          return
+        }
+
+        // Blur check AFTER card-size check (a far-away card gives meaningless blur scores)
+        if (lapVariance < 20) {
+          resolve({
+            warning: 'Photo looks blurry. Hold the phone steady and tap the card to focus.',
+            bounds: null,
+          })
+          return
+        }
+
+        // ── Compute crop bounds in original-image coordinates ────────────────
+        // Add 3 % padding on each side so we don't clip the card edge.
+        const PAD = 0.03
+        const padX = SW * PAD
+        const padY = SH * PAD
+        const sx = img.naturalWidth  / SW
+        const sy = img.naturalHeight / SH
+
+        const bounds: CardBounds = {
+          x: Math.max(0,                   (left   - padX) * sx),
+          y: Math.max(0,                   (top    - padY) * sy),
+          w: Math.min(img.naturalWidth,    (right  - left + 2 * padX) * sx),
+          h: Math.min(img.naturalHeight,   (bottom - top  + 2 * padY) * sy),
+        }
+
+        resolve({ warning: null, bounds })
+      } catch {
+        // Analysis is best-effort — never block the user on a check failure
+        resolve({ warning: null, bounds: null })
+      }
     }
 
     img.onerror = () => {
       URL.revokeObjectURL(url)
-      resolve(null)
+      resolve({ warning: null, bounds: null })
     }
 
     img.src = url
@@ -67,18 +186,15 @@ async function checkImageQuality(file: File): Promise<string | null> {
 }
 
 // ── Canvas preprocessing pipeline ─────────────────────────────────────────────
-// Produces a grayscale, contrast-boosted, OCR-optimised version of the card.
-// The original file is kept untouched for the preview.
+// 1. Crop to card bounds (if detected) — done in one drawImage call
+// 2. Resize to ≤ 1600 px wide for OCR-optimal resolution
+// 3. Pass 1: grayscale + find luminance range [lo, hi]
+// 4. Pass 2: histogram stretch → [0, 255], then +25 % contrast boost
+// 5. Output as PNG (lossless — no JPEG artefacts on text edges)
 //
-// Pipeline:
-//   1. Resize to ≤ 1600 px wide (Tesseract accuracy peaks at ~300–450 DPI
-//      for business-card text; 1600 px on a 3.5" card ≈ 457 DPI)
-//   2. Pass 1 — luminosity grayscale + find histogram bounds [lo, hi]
-//   3. Pass 2 — stretch histogram to 0–255, then apply 25% contrast boost
-//      via (v − 128) × 1.25 + 128 to push dark text darker and backgrounds lighter
-//   4. Output as PNG (lossless; avoids JPEG block artefacts on text edges)
+// The user-visible preview always shows the original file, not this processed version.
 
-async function preprocessForOCR(file: File): Promise<Blob> {
+async function preprocessForOCR(file: File, bounds: CardBounds | null): Promise<Blob> {
   return new Promise((resolve, reject) => {
     const img = new Image()
     const url = URL.createObjectURL(file)
@@ -86,24 +202,32 @@ async function preprocessForOCR(file: File): Promise<Blob> {
     img.onload = () => {
       URL.revokeObjectURL(url)
       try {
+        // Source region: use crop bounds if available, otherwise full image
+        const srcX = bounds?.x ?? 0
+        const srcY = bounds?.y ?? 0
+        const srcW = bounds?.w ?? img.naturalWidth
+        const srcH = bounds?.h ?? img.naturalHeight
+
+        // Scale the crop region to ≤ 1600 px wide
         const MAX_W = 1600
-        const scale = img.naturalWidth > MAX_W ? MAX_W / img.naturalWidth : 1
-        const w = Math.round(img.naturalWidth * scale)
-        const h = Math.round(img.naturalHeight * scale)
+        const scale = srcW > MAX_W ? MAX_W / srcW : 1
+        const dstW  = Math.round(srcW * scale)
+        const dstH  = Math.round(srcH * scale)
 
         const canvas = document.createElement('canvas')
-        canvas.width = w
-        canvas.height = h
-        // willReadFrequently hints to the browser to keep pixel data CPU-accessible
+        canvas.width  = dstW
+        canvas.height = dstH
         const ctx = canvas.getContext('2d', { willReadFrequently: true })
         if (!ctx) { reject(new Error('No canvas context')); return }
 
-        ctx.drawImage(img, 0, 0, w, h)
-        const id = ctx.getImageData(0, 0, w, h)
-        const d = id.data
-        const n = w * h
+        // Crop + resize in one drawImage call
+        ctx.drawImage(img, srcX, srcY, srcW, srcH, 0, 0, dstW, dstH)
 
-        // Pass 1 — grayscale + find luminance range
+        const id = ctx.getImageData(0, 0, dstW, dstH)
+        const d  = id.data
+        const n  = dstW * dstH
+
+        // Pass 1 — luminosity grayscale + histogram bounds
         const gray = new Uint8Array(n)
         let lo = 255, hi = 0
         for (let i = 0, j = 0; i < d.length; i += 4, j++) {
@@ -115,19 +239,15 @@ async function preprocessForOCR(file: File): Promise<Blob> {
 
         const range = hi - lo || 1
 
-        // Pass 2 — histogram stretch + contrast boost
+        // Pass 2 — histogram stretch + 25 % contrast boost
         for (let i = 0, j = 0; i < d.length; i += 4, j++) {
-          // Stretch: map [lo, hi] → [0, 255]
           const stretched = ((gray[j] - lo) / range * 255) | 0
-          // Boost: amplify contrast by 25% around the midpoint
           const v = Math.min(255, Math.max(0, ((stretched - 128) * 1.25 + 128) | 0))
           d[i] = d[i + 1] = d[i + 2] = v
           // alpha unchanged
         }
 
         ctx.putImageData(id, 0, 0)
-
-        // PNG is lossless — important for preserving text edge sharpness
         canvas.toBlob(
           blob => blob ? resolve(blob) : reject(new Error('Canvas toBlob failed')),
           'image/png',
@@ -146,8 +266,7 @@ async function preprocessForOCR(file: File): Promise<Blob> {
   })
 }
 
-// ── Deterministic OCR parser ───────────────────────────────────────────────────
-// Fallback when AI step is unavailable or returns nothing useful.
+// ── Deterministic OCR parser (fallback) ───────────────────────────────────────
 
 function parseCard(rawText: string): Partial<Contact> {
   const lines = rawText.split('\n').map(l => l.trim()).filter(l => l.length > 1)
@@ -250,15 +369,16 @@ function hasAnyField(fields: Partial<Contact>): boolean {
 // ── Component ─────────────────────────────────────────────────────────────────
 
 export default function BusinessCardScanner({ onExtract }: BusinessCardScannerProps) {
-  const [open, setOpen] = useState(false)
-  const [phase, setPhase] = useState<Phase>('idle')
+  const [open, setOpen]                   = useState(false)
+  const [phase, setPhase]                 = useState<Phase>('idle')
   const [processingLabel, setProcessingLabel] = useState<ProcessingLabel>('preprocessing')
-  const [imageUrl, setImageUrl] = useState<string | null>(null)
-  const [pendingFile, setPendingFile] = useState<File | null>(null)
-  const [warningMsg, setWarningMsg] = useState('')
-  const [extracted, setExtracted] = useState<Partial<Contact>>({})
-  const [parsedByAI, setParsedByAI] = useState(false)
-  const [errorMsg, setErrorMsg] = useState('')
+  const [imageUrl, setImageUrl]           = useState<string | null>(null)
+  const [pendingFile, setPendingFile]     = useState<File | null>(null)
+  const [pendingBounds, setPendingBounds] = useState<CardBounds | null>(null)
+  const [warningMsg, setWarningMsg]       = useState('')
+  const [extracted, setExtracted]         = useState<Partial<Contact>>({})
+  const [parsedByAI, setParsedByAI]       = useState(false)
+  const [errorMsg, setErrorMsg]           = useState('')
 
   const cameraRef = useRef<HTMLInputElement>(null)
   const uploadRef = useRef<HTMLInputElement>(null)
@@ -269,6 +389,7 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
     setProcessingLabel('preprocessing')
     setImageUrl(null)
     setPendingFile(null)
+    setPendingBounds(null)
     setWarningMsg('')
     setExtracted({})
     setParsedByAI(false)
@@ -277,15 +398,17 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
 
   const close = () => { reset(); setOpen(false) }
 
-  // ── startProcessing: runs after quality check passes ──────────────────────
+  // ── startProcessing ───────────────────────────────────────────────────────
+  // Called once quality check passes (or user chooses "Continue anyway").
+  // bounds may be null; preprocessForOCR falls back to full image in that case.
 
-  const startProcessing = async (file: File) => {
+  const startProcessing = async (file: File, bounds: CardBounds | null) => {
     setPhase('processing')
     setProcessingLabel('preprocessing')
 
     try {
-      // Step 1: Canvas preprocessing (grayscale + auto-contrast + resize)
-      const processedBlob = await preprocessForOCR(file)
+      // Step 1: Crop to card region + grayscale + contrast boost
+      const processedBlob = await preprocessForOCR(file, bounds)
 
       // Step 2: Tesseract OCR on the processed image
       setProcessingLabel('loading')
@@ -302,7 +425,7 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
       // Step 3: AI parsing → silent fallback to deterministic
       setProcessingLabel('parsing')
       const aiFields = await parseWithAI(rawText)
-      const usedAI = aiFields !== null && hasAnyField(aiFields)
+      const usedAI   = aiFields !== null && hasAnyField(aiFields)
       const fields: Partial<Contact> = usedAI ? aiFields! : parseCard(rawText)
 
       if (!hasAnyField(fields)) {
@@ -321,39 +444,43 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
     }
   }
 
-  // ── handleFileChange: quality check first, then process or warn ───────────
+  // ── handleFileChange ──────────────────────────────────────────────────────
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
     e.target.value = ''
 
-    // Show preview immediately while quality check runs
+    // Show preview immediately while analysis runs
     const url = URL.createObjectURL(file)
     setImageUrl(url)
 
-    const warning = await checkImageQuality(file)
+    const { warning, bounds } = await analyzeImage(file)
+
     if (warning) {
       setPendingFile(file)
+      setPendingBounds(bounds)   // might be null — pass through either way
       setWarningMsg(warning)
       setPhase('warning')
       return
     }
 
-    startProcessing(file)
+    startProcessing(file, bounds)
   }
 
   const handleContinue = () => {
     const file = pendingFile
     if (!file) return
+    const bounds = pendingBounds
     setPendingFile(null)
+    setPendingBounds(null)
     setWarningMsg('')
-    startProcessing(file)
+    startProcessing(file, bounds)
   }
 
   const handleApply = () => { onExtract(extracted); close() }
 
-  // ── Trigger button (collapsed) ─────────────────────────────────────────────
+  // ── Trigger button (collapsed) ────────────────────────────────────────────
 
   if (!open) {
     return (
@@ -437,7 +564,7 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
             <SpinnerIcon />
             <div>
               {processingLabel === 'preprocessing' && (
-                <p className="text-sm text-zinc-600 dark:text-zinc-300">Enhancing image…</p>
+                <p className="text-sm text-zinc-600 dark:text-zinc-300">Preparing image…</p>
               )}
               {processingLabel === 'loading' && (
                 <>
@@ -505,7 +632,7 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
   )
 }
 
-// ── Image preview ──────────────────────────────────────────────────────────────
+// ── Subcomponents ─────────────────────────────────────────────────────────────
 
 function CardImage({ src }: { src: string }) {
   return (
