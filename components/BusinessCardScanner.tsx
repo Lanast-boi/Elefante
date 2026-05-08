@@ -8,7 +8,22 @@ export type BusinessCardScannerProps = {
 }
 
 type Phase = 'idle' | 'warning' | 'processing' | 'review' | 'error'
-type ProcessingLabel = 'preprocessing' | 'loading' | 'reading' | 'parsing'
+type ProcessingLabel = 'scanning' | 'preprocessing' | 'loading' | 'reading' | 'parsing'
+
+// Unified response shape from the edge function
+interface EdgeFunctionResponse {
+  name?:        string | null
+  company?:     string | null
+  role?:        string | null
+  phone?:       string | null
+  email?:       string | null
+  website?:     string | null
+  city?:        string | null
+  country?:     string | null
+  confidence?:  number
+  source?:      'vision' | 'ocr'
+  warnings?:    string[]
+}
 
 // ── Image analysis types ───────────────────────────────────────────────────────
 
@@ -266,6 +281,99 @@ async function preprocessForOCR(file: File, bounds: CardBounds | null): Promise<
   })
 }
 
+// ── Vision helpers ────────────────────────────────────────────────────────────
+
+// Compress the image (or its cropped region) to a JPEG suitable for Vision.
+// Keeps colour — do NOT grayscale here, Claude Vision uses colour information.
+// Max 1024 px on the longest side; JPEG 85 % quality ≈ 150–400 KB encoded.
+async function compressForVision(
+  file: File,
+  bounds: CardBounds | null,
+): Promise<{ base64: string; mimeType: string } | null> {
+  return new Promise(resolve => {
+    const img = new Image()
+    const url = URL.createObjectURL(file)
+
+    img.onload = () => {
+      URL.revokeObjectURL(url)
+      try {
+        const srcX = bounds?.x ?? 0
+        const srcY = bounds?.y ?? 0
+        const srcW = bounds?.w ?? img.naturalWidth
+        const srcH = bounds?.h ?? img.naturalHeight
+
+        const MAX_SIDE = 1024
+        const scale = Math.min(1, MAX_SIDE / Math.max(srcW, srcH))
+        const dstW  = Math.round(srcW * scale)
+        const dstH  = Math.round(srcH * scale)
+
+        const canvas = document.createElement('canvas')
+        canvas.width  = dstW
+        canvas.height = dstH
+        const ctx = canvas.getContext('2d')
+        if (!ctx) { resolve(null); return }
+
+        // Crop + resize; keep full colour for Claude Vision
+        ctx.drawImage(img, srcX, srcY, srcW, srcH, 0, 0, dstW, dstH)
+
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.85)
+        const base64  = dataUrl.split(',')[1]
+
+        // Safety guard: reject if somehow > 4 MB encoded (Anthropic limit is 5 MB)
+        if (!base64 || base64.length > 4 * 1024 * 1024) { resolve(null); return }
+
+        resolve({ base64, mimeType: 'image/jpeg' })
+      } catch {
+        resolve(null)
+      }
+    }
+
+    img.onerror = () => { URL.revokeObjectURL(url); resolve(null) }
+    img.src = url
+  })
+}
+
+// Map a raw EdgeFunctionResponse to Partial<Contact>.
+// Fields not present in Contact (website, country, confidence, source, warnings)
+// are silently dropped — the user sees only the contact-relevant fields in review.
+function edgeResponseToContact(data: EdgeFunctionResponse): Partial<Contact> {
+  const clean: Partial<Contact> = {}
+  if (data.name?.trim())    clean.name    = data.name.trim()
+  if (data.email?.trim())   clean.email   = data.email.toLowerCase().trim()
+  if (data.phone?.trim())   clean.phone   = data.phone.trim()
+  if (data.company?.trim()) clean.company = data.company.trim()
+  if (data.role?.trim())    clean.role    = data.role.trim()
+  if (data.city?.trim())    clean.city    = data.city.trim()
+  return clean
+}
+
+// Call the edge function with the compressed image.
+// Returns null on any failure so the caller can fall back to OCR.
+async function tryVisionParse(
+  file: File,
+  bounds: CardBounds | null,
+): Promise<Partial<Contact> | null> {
+  try {
+    const compressed = await compressForVision(file, bounds)
+    if (!compressed) return null
+
+    const { data, error } = await supabase.functions.invoke<EdgeFunctionResponse>(
+      'parse-business-card',
+      { body: { imageBase64: compressed.base64, mimeType: compressed.mimeType } },
+    )
+    if (error || !data) return null
+
+    // Reject low-confidence or empty results so the OCR fallback gets a chance
+    if (typeof data.confidence === 'number' && data.confidence < 0.3) return null
+
+    const fields = edgeResponseToContact(data)
+    const hasIdentity = !!(fields.name || fields.company || fields.email || fields.phone)
+    return hasIdentity ? fields : null
+  } catch {
+    return null
+  }
+}
+
 // ── Deterministic OCR parser (fallback) ───────────────────────────────────────
 
 function parseCard(rawText: string): Partial<Contact> {
@@ -337,19 +445,13 @@ function parseCard(rawText: string): Partial<Contact> {
 
 async function parseWithAI(rawText: string): Promise<Partial<Contact> | null> {
   try {
-    const { data, error } = await supabase.functions.invoke<Record<string, string>>(
+    const { data, error } = await supabase.functions.invoke<EdgeFunctionResponse>(
       'parse-business-card',
       { body: { rawText: rawText.slice(0, 2000) } },
     )
     if (error || !data) return null
-    const clean: Partial<Contact> = {}
-    if (data.name?.trim())    clean.name    = data.name.trim()
-    if (data.email?.trim())   clean.email   = data.email.toLowerCase().trim()
-    if (data.phone?.trim())   clean.phone   = data.phone.trim()
-    if (data.company?.trim()) clean.company = data.company.trim()
-    if (data.role?.trim())    clean.role    = data.role.trim()
-    if (data.city?.trim())    clean.city    = data.city.trim()
-    return Object.keys(clean).length > 0 ? clean : null
+    const fields = edgeResponseToContact(data)
+    return Object.keys(fields).length > 0 ? fields : null
   } catch {
     return null
   }
@@ -404,13 +506,29 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
 
   const startProcessing = async (file: File, bounds: CardBounds | null) => {
     setPhase('processing')
-    setProcessingLabel('preprocessing')
+    setProcessingLabel('scanning')
 
     try {
-      // Step 1: Crop to card region + grayscale + contrast boost
+      // ── Path 1: Vision (primary) ────────────────────────────────────────────
+      // Send compressed image directly to the edge function; Claude reads it visually.
+      // Much more accurate than OCR for business cards with complex layouts.
+      const visionFields = await tryVisionParse(file, bounds)
+      if (visionFields && hasAnyField(visionFields)) {
+        setExtracted(visionFields)
+        setParsedByAI(true)
+        setPhase('review')
+        return
+      }
+
+      // ── Path 2: OCR fallback ─────────────────────────────────────────────────
+      // Vision unavailable, failed, low-confidence, or returned no identity fields.
+      // Fall back to the existing Tesseract → edge function text pipeline.
+
+      // Step 1: crop + grayscale + contrast boost
+      setProcessingLabel('preprocessing')
       const processedBlob = await preprocessForOCR(file, bounds)
 
-      // Step 2: Tesseract OCR on the processed image
+      // Step 2: Tesseract OCR
       setProcessingLabel('loading')
       const { createWorker } = await import('tesseract.js')
       const worker = await createWorker('eng', 1, {
@@ -422,7 +540,7 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
       const { data: { text: rawText } } = await worker.recognize(processedBlob)
       await worker.terminate()
 
-      // Step 3: AI parsing → silent fallback to deterministic
+      // Step 3: edge function text parser → deterministic fallback
       setProcessingLabel('parsing')
       const aiFields = await parseWithAI(rawText)
       const usedAI   = aiFields !== null && hasAnyField(aiFields)
@@ -563,6 +681,9 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
           <div className="flex items-start gap-3 mt-4">
             <SpinnerIcon />
             <div>
+              {processingLabel === 'scanning' && (
+                <p className="text-sm text-zinc-600 dark:text-zinc-300">Reading with AI…</p>
+              )}
               {processingLabel === 'preprocessing' && (
                 <p className="text-sm text-zinc-600 dark:text-zinc-300">Preparing image…</p>
               )}
