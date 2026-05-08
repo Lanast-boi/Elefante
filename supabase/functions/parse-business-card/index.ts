@@ -524,9 +524,9 @@ async function callAnthropicVision(
       'content-type':      'application/json',
     },
     body: JSON.stringify({
-      // Same model as the OCR text path — confirmed working in this project,
-      // has full vision support (released November 2024).
-      model:      'claude-3-5-haiku-20241022',
+      // Sonnet 4.5 for Vision — better at reading card layouts; all 4.x models
+      // support image_input. This account has no access to claude-3.x models.
+      model:      'claude-sonnet-4-5-20250929',
       max_tokens: 600,
       system:     VISION_SYSTEM_PROMPT,
       messages: [{
@@ -561,7 +561,8 @@ async function callAnthropicText(
       'content-type':      'application/json',
     },
     body: JSON.stringify({
-      model:      'claude-3-5-haiku-20241022',
+      // Haiku 4.5 for OCR text — fast, cheap, adequate for structured extraction.
+      model:      'claude-haiku-4-5-20251001',
       max_tokens: 400,
       system:     OCR_SYSTEM_PROMPT,
       messages:   [{ role: 'user', content: prompt }],
@@ -611,16 +612,16 @@ Deno.serve(async (req: Request) => {
     if (!ALLOWED_TYPES.includes(mimeType))
       return respond({ error: 'Unsupported mimeType' }, 400)
 
-    console.log(`[parse-business-card] Vision path, mimeType=${mimeType}, b64len=${imageBase64.length}`)
+    console.log(`[parse-business-card] Vision path | mimeType=${mimeType} | b64len=${imageBase64.length} | apiKey=${apiKey ? 'SET' : '*** NOT SET ***'}`)
 
     if (!apiKey) {
-      console.warn('[parse-business-card] ANTHROPIC_API_KEY not set')
-      return respond({ error: 'AI parsing not configured' }, 503)
+      console.error('[parse-business-card] *** ANTHROPIC_API_KEY secret is missing — run: supabase secrets set ANTHROPIC_API_KEY=sk-ant-... ***')
+      return respond({ error: 'AI parsing not configured — ANTHROPIC_API_KEY secret is missing' }, 503)
     }
 
     try {
       const aiText = await callAnthropicVision(apiKey, imageBase64, mimeType)
-      console.log('[parse-business-card] Vision AI response:', aiText)
+      console.log('[parse-business-card] Vision AI raw response:', aiText.slice(0, 400))
 
       const raw    = extractJsonFromText(aiText)
       if (!raw) throw new Error('No JSON in Vision response')
@@ -639,14 +640,21 @@ Deno.serve(async (req: Request) => {
     const rawText    = normalizeText(body.rawText.trim().slice(0, 2000))
     const candidates = deterministicExtract(rawText)
 
-    console.log('[parse-business-card] OCR path, rawText:\n' + rawText)
+    console.log(`[parse-business-card] OCR path | chars=${rawText.length} | apiKey=${apiKey ? 'SET' : '*** NOT SET ***'}`)
+    console.log('[parse-business-card] rawText:\n' + rawText)
     console.log('[parse-business-card] candidates:', JSON.stringify(candidates))
 
     if (!apiKey) {
-      console.warn('[parse-business-card] ANTHROPIC_API_KEY not set — deterministic fallback')
+      console.error('[parse-business-card] *** ANTHROPIC_API_KEY secret is missing ***')
+      // Distinct warning so curl tests can tell this apart from an Anthropic API error
       const fallback = deterministicFallback(candidates)
+      fallback.warnings = ['key-missing: ANTHROPIC_API_KEY secret not found in Deno.env']
       return respond(fallback, 200)
     }
+
+    // Log a prefix of the key so we can confirm which key the function is using
+    // (never log the full key)
+    console.log(`[parse-business-card] apiKey prefix: ${apiKey.slice(0, 20)}...`)
 
     let fields: ParsedFields
     try {
@@ -659,8 +667,10 @@ Deno.serve(async (req: Request) => {
 
       fields = postProcessOcr(raw, candidates)
     } catch (err) {
-      console.error('[parse-business-card] OCR AI failed, using deterministic fallback:', err)
+      // Distinct warning + error detail so curl tests can see the Anthropic error
+      console.error('[parse-business-card] OCR AI failed:', err)
       fields = deterministicFallback(candidates)
+      fields.warnings = [`anthropic-error: ${String(err).slice(0, 300)}`]
     }
 
     console.log('[parse-business-card] OCR final fields:', JSON.stringify(fields))
