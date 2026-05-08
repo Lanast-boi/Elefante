@@ -56,27 +56,32 @@ const PHONE_PRIORITY: Record<PhoneLabel, number> = {
 const LEGAL_ENTITY_RE =
   /\b(S\.L\.?|SL|S\.A\.?|SA|GmbH|Ltd\.?|Inc\.?|S\.A\.S\.?|SAS|LLC|L\.L\.C\.?|B\.V\.?|BV|N\.V\.?|NV|Corp\.?|A\.G\.?|AG|K\.G\.?|KG|OHG|SpA|SARL|S\.R\.L\.?|SRL|PLC|AB|AS|OY|A\/S)\b/
 
-// Role/title keywords — multilingual, used for line scoring
-const ROLE_RE = /\b(
-  director\s+general|managing\s+director|general\s+manager|gerente\s+general|
-  director|ceo|cto|cfo|coo|cso|chro|cpo|
-  founder|co-?founder|cofundador|
-  partner|socio|
-  manager|gerente|responsable|
-  comercial|account\s+executive|
-  sales|ventas|
-  engineer|ingeniero|
-  project\s+manager|
-  business\s+development|
-  analyst|analista|
-  consultant|consultor|
-  architect|arquitecto|
-  head\s+of|jefe\s+de|
-  president|presidente|
-  vice\s+president|vicepresidente|
-  executive|ejecutivo|
-  specialist|especialista
-)\b/ix
+// Role/title keywords — multilingual, used for line scoring.
+// Built with new RegExp() because JS regex literals cannot span multiple lines
+// and the 'x' (verbose) flag does not exist in V8/Deno.
+const ROLE_RE = new RegExp(
+  '\\b(' + [
+    'director\\s+general', 'managing\\s+director', 'general\\s+manager', 'gerente\\s+general',
+    'director', 'ceo', 'cto', 'cfo', 'coo', 'cso', 'chro', 'cpo',
+    'founder', 'co-?founder', 'cofundador',
+    'partner', 'socio',
+    'manager', 'gerente', 'responsable',
+    'comercial', 'account\\s+executive',
+    'sales', 'ventas',
+    'engineer', 'ingeniero',
+    'project\\s+manager',
+    'business\\s+development',
+    'analyst', 'analista',
+    'consultant', 'consultor',
+    'architect', 'arquitecto',
+    'head\\s+of', 'jefe\\s+de',
+    'president', 'presidente',
+    'vice\\s+president', 'vicepresidente',
+    'executive', 'ejecutivo',
+    'specialist', 'especialista',
+  ].join('|') + ')\\b',
+  'i',
+)
 
 // Label prefixes that can never be company or role
 const LABEL_PREFIX_RE =
