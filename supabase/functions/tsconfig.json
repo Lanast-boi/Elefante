@@ -1,0 +1,12 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ES2022",
+    "moduleResolution": "node",
+    "strict": true,
+    "noEmit": true,
+    "types": ["https://raw.githubusercontent.com/denoland/deno/main/cli/tsc/dts/lib.deno.d.ts"]
+  },
+  "include": ["./**/*.ts"]
+}

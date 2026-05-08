@@ -1,5 +1,6 @@
 'use client'
 import { useRef, useState } from 'react'
+import { supabase } from '@/lib/supabase'
 import { Contact } from '@/lib/types'
 
 export type BusinessCardScannerProps = {
@@ -7,9 +8,11 @@ export type BusinessCardScannerProps = {
 }
 
 type Phase = 'idle' | 'processing' | 'review' | 'error'
+type ProcessingLabel = 'loading' | 'reading' | 'parsing'
 
-// ── OCR text parser ────────────────────────────────────────────────────────────
-// Heuristics only — fields are suggestions for the user to review, not guaranteed.
+// ── Deterministic OCR parser ───────────────────────────────────────────────────
+// Used as a fallback when the AI step is unavailable or returns nothing useful.
+// Heuristics only — fields are suggestions for the user to review.
 
 function parseCard(rawText: string): Partial<Contact> {
   const lines = rawText
@@ -122,21 +125,50 @@ function parseCard(rawText: string): Partial<Contact> {
     if (companyLine) result.company = companyLine
   }
 
-  // Note: no auto-tag. Tagging is the user's choice.
   return result
+}
+
+// ── AI parser — calls the Supabase Edge Function ───────────────────────────────
+// Returns null on any error so callers always have a safe fallback.
+// The image is never sent — only the raw OCR text string.
+
+async function parseWithAI(rawText: string): Promise<Partial<Contact> | null> {
+  try {
+    const { data, error } = await supabase.functions.invoke<Record<string, string>>(
+      'parse-business-card',
+      { body: { rawText: rawText.slice(0, 2000) } },
+    )
+
+    if (error || !data) return null
+
+    // Validate: accept only truthy string values for the known fields
+    const clean: Partial<Contact> = {}
+    if (data.name?.trim())    clean.name    = data.name.trim()
+    if (data.email?.trim())   clean.email   = data.email.toLowerCase().trim()
+    if (data.phone?.trim())   clean.phone   = data.phone.trim()
+    if (data.company?.trim()) clean.company = data.company.trim()
+    if (data.role?.trim())    clean.role    = data.role.trim()
+    if (data.city?.trim())    clean.city    = data.city.trim()
+
+    return Object.keys(clean).length > 0 ? clean : null
+  } catch {
+    return null
+  }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 const FIELD_LABELS: Partial<Record<keyof Contact, string>> = {
-  name: 'Name',
-  email: 'Email',
-  phone: 'Phone',
+  name:    'Name',
+  email:   'Email',
+  phone:   'Phone',
   company: 'Company',
-  role: 'Role',
+  role:    'Role',
+  city:    'City',
 }
 
-const DISPLAYED_FIELDS: (keyof Contact)[] = ['name', 'email', 'phone', 'company', 'role']
+// City is included here and in FIELD_LABELS so AI-extracted city is shown in review.
+const DISPLAYED_FIELDS: (keyof Contact)[] = ['name', 'email', 'phone', 'company', 'role', 'city']
 
 function hasAnyField(fields: Partial<Contact>): boolean {
   return DISPLAYED_FIELDS.some(k => fields[k])
@@ -147,21 +179,22 @@ function hasAnyField(fields: Partial<Contact>): boolean {
 export default function BusinessCardScanner({ onExtract }: BusinessCardScannerProps) {
   const [open, setOpen] = useState(false)
   const [phase, setPhase] = useState<Phase>('idle')
-  const [processingLabel, setProcessingLabel] = useState<'loading' | 'reading'>('loading')
+  const [processingLabel, setProcessingLabel] = useState<ProcessingLabel>('loading')
   const [imageUrl, setImageUrl] = useState<string | null>(null)
   const [extracted, setExtracted] = useState<Partial<Contact>>({})
+  const [parsedByAI, setParsedByAI] = useState(false)
   const [errorMsg, setErrorMsg] = useState('')
 
   const cameraRef = useRef<HTMLInputElement>(null)
   const uploadRef = useRef<HTMLInputElement>(null)
 
   const reset = () => {
-    // Revoke any object URL to avoid memory leaks
     if (imageUrl) URL.revokeObjectURL(imageUrl)
     setPhase('idle')
     setProcessingLabel('loading')
     setImageUrl(null)
     setExtracted({})
+    setParsedByAI(false)
     setErrorMsg('')
   }
 
@@ -177,22 +210,22 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
     setProcessingLabel('loading')
 
     try {
+      // ── Step 1: OCR ──────────────────────────────────────────────────────────
       const { createWorker } = await import('tesseract.js')
-      // Logger fires during recognition to update the stage label
       const worker = await createWorker('eng', 1, {
         logger: (m: { status: string; progress: number }) => {
-          if (m.status === 'recognizing text') {
-            setProcessingLabel('reading')
-          }
+          if (m.status === 'recognizing text') setProcessingLabel('reading')
         },
       })
-
-      // Even without the logger callback, mark reading once worker is ready
       setProcessingLabel('reading')
-      const { data: { text } } = await worker.recognize(file)
+      const { data: { text: rawText } } = await worker.recognize(file)
       await worker.terminate()
 
-      const fields = parseCard(text)
+      // ── Step 2: AI parsing → silent fallback to deterministic ─────────────
+      setProcessingLabel('parsing')
+      const aiFields = await parseWithAI(rawText)
+      const usedAI = aiFields !== null && hasAnyField(aiFields)
+      const fields: Partial<Contact> = usedAI ? aiFields! : parseCard(rawText)
 
       if (!hasAnyField(fields)) {
         setErrorMsg("Couldn't find recognisable contact fields. Try a clearer photo with good lighting.")
@@ -201,6 +234,7 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
       }
 
       setExtracted(fields)
+      setParsedByAI(usedAI)
       setPhase('review')
     } catch (err) {
       console.error('[BusinessCardScanner]', err)
@@ -212,7 +246,7 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
-    e.target.value = ''   // reset so the same file can be re-selected after retry
+    e.target.value = ''
     processImage(file)
   }
 
@@ -246,7 +280,6 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
         <span className="text-xs font-semibold text-zinc-500 dark:text-zinc-400 uppercase tracking-widest">
           Scan business card
         </span>
-        {/* -m-2 + p-2 keeps the visual position but enlarges the touch target */}
         <button
           type="button"
           onClick={close}
@@ -283,34 +316,30 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
             Fields are suggestions — you can edit before saving.
           </p>
 
-          {/* Hidden inputs — camera uses capture="environment" to open back camera directly */}
-          <input ref={cameraRef}  type="file" accept="image/*" capture="environment" onChange={handleFileChange} className="hidden" />
-          <input ref={uploadRef}  type="file" accept="image/*"                        onChange={handleFileChange} className="hidden" />
+          <input ref={cameraRef} type="file" accept="image/*" capture="environment" onChange={handleFileChange} className="hidden" />
+          <input ref={uploadRef} type="file" accept="image/*"                        onChange={handleFileChange} className="hidden" />
         </>
       )}
 
       {/* ── Processing ── */}
       {phase === 'processing' && (
         <>
-          {/* Full-width image preview so the user sees what was captured */}
           {imageUrl && <CardImage src={imageUrl} />}
 
           <div className="flex items-start gap-3 mt-4">
             <SpinnerIcon />
             <div>
-              {processingLabel === 'loading' ? (
+              {processingLabel === 'loading' && (
                 <>
-                  <p className="text-sm text-zinc-600 dark:text-zinc-300 leading-snug">
-                    Loading OCR engine…
-                  </p>
-                  <p className="text-xs text-zinc-400 dark:text-zinc-500 mt-0.5">
-                    First use downloads ~2 MB of language data.
-                  </p>
+                  <p className="text-sm text-zinc-600 dark:text-zinc-300 leading-snug">Loading OCR engine…</p>
+                  <p className="text-xs text-zinc-400 dark:text-zinc-500 mt-0.5">First use downloads ~2 MB of language data.</p>
                 </>
-              ) : (
-                <p className="text-sm text-zinc-600 dark:text-zinc-300">
-                  Reading card…
-                </p>
+              )}
+              {processingLabel === 'reading' && (
+                <p className="text-sm text-zinc-600 dark:text-zinc-300">Reading card…</p>
+              )}
+              {processingLabel === 'parsing' && (
+                <p className="text-sm text-zinc-600 dark:text-zinc-300">Parsing fields…</p>
               )}
             </div>
           </div>
@@ -331,7 +360,6 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
                   <dt className="text-xs text-zinc-400 dark:text-zinc-500 w-16 shrink-0 leading-5">
                     {FIELD_LABELS[key]}
                   </dt>
-                  {/* break-words so long emails / phone numbers don't truncate */}
                   <dd className="text-sm text-zinc-700 dark:text-zinc-300 min-w-0 break-words leading-5">
                     {String(value)}
                   </dd>
@@ -341,7 +369,10 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
           </dl>
 
           <p className="text-xs text-zinc-400 dark:text-zinc-500 mt-4 mb-3 leading-relaxed">
-            These are suggestions — review and edit in the form before saving.
+            {parsedByAI
+              ? 'Parsed with AI — review and edit before saving.'
+              : 'Auto-detected — review and edit before saving.'
+            }
           </p>
 
           <div className="flex items-center gap-4">
@@ -366,12 +397,8 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
       {/* ── Error ── */}
       {phase === 'error' && (
         <>
-          {/* Keep image visible so the user can see what failed */}
           {imageUrl && <CardImage src={imageUrl} />}
-
-          <p className="text-sm text-zinc-500 dark:text-zinc-400 mt-4 leading-relaxed">
-            {errorMsg}
-          </p>
+          <p className="text-sm text-zinc-500 dark:text-zinc-400 mt-4 leading-relaxed">{errorMsg}</p>
           <button
             type="button"
             onClick={reset}
@@ -386,8 +413,6 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
 }
 
 // ── Shared image preview ──────────────────────────────────────────────────────
-// aspect-[7/4] ≈ business card ratio (3.5" × 2"). object-contain shows the full
-// card without cropping; the tinted background fills any letterbox bars.
 
 function CardImage({ src }: { src: string }) {
   return (
