@@ -283,9 +283,12 @@ async function preprocessForOCR(file: File, bounds: CardBounds | null): Promise<
 
 // ── Vision helpers ────────────────────────────────────────────────────────────
 
-// Compress the image (or its cropped region) to a JPEG suitable for Vision.
-// Keeps colour — do NOT grayscale here, Claude Vision uses colour information.
-// Max 1024 px on the longest side; JPEG 85 % quality ≈ 150–400 KB encoded.
+// Compress the image (or its cropped card region) to a JPEG suitable for Vision.
+// Keeps colour — do NOT grayscale; Claude Vision uses colour information.
+//
+// When card bounds are available we crop tightly to the card (+ 6 % padding)
+// before resizing, so the card fills the entire image sent to the model.
+// Max 1600 px on the longest side; JPEG quality 0.9.
 async function compressForVision(
   file: File,
   bounds: CardBounds | null,
@@ -297,15 +300,33 @@ async function compressForVision(
     img.onload = () => {
       URL.revokeObjectURL(url)
       try {
-        const srcX = bounds?.x ?? 0
-        const srcY = bounds?.y ?? 0
-        const srcW = bounds?.w ?? img.naturalWidth
-        const srcH = bounds?.h ?? img.naturalHeight
+        // ── Determine source crop region ─────────────────────────────────────
+        let srcX: number, srcY: number, srcW: number, srcH: number
 
-        const MAX_SIDE = 1024
-        const scale = Math.min(1, MAX_SIDE / Math.max(srcW, srcH))
-        const dstW  = Math.round(srcW * scale)
-        const dstH  = Math.round(srcH * scale)
+        if (bounds) {
+          // Expand the detected card region by 6 % on each side so we don't
+          // clip card edges. Clamp to image boundaries.
+          const PAD  = 0.06
+          const padW = bounds.w * PAD
+          const padH = bounds.h * PAD
+          srcX = Math.max(0, bounds.x - padW)
+          srcY = Math.max(0, bounds.y - padH)
+          srcW = Math.min(img.naturalWidth  - srcX, bounds.w + 2 * padW)
+          srcH = Math.min(img.naturalHeight - srcY, bounds.h + 2 * padH)
+        } else {
+          // No crop bounds detected — send the full image
+          srcX = 0; srcY = 0
+          srcW = img.naturalWidth
+          srcH = img.naturalHeight
+        }
+
+        // ── Resize the cropped region ─────────────────────────────────────────
+        // 1600 px max keeps text readable at business-card scales while staying
+        // well below Anthropic's 5 MB image limit.
+        const MAX_SIDE = 1600
+        const scale    = Math.min(1, MAX_SIDE / Math.max(srcW, srcH))
+        const dstW     = Math.round(srcW * scale)
+        const dstH     = Math.round(srcH * scale)
 
         const canvas = document.createElement('canvas')
         canvas.width  = dstW
@@ -313,13 +334,23 @@ async function compressForVision(
         const ctx = canvas.getContext('2d')
         if (!ctx) { resolve(null); return }
 
-        // Crop + resize; keep full colour for Claude Vision
+        // Crop + resize in one call; keep full colour
         ctx.drawImage(img, srcX, srcY, srcW, srcH, 0, 0, dstW, dstH)
 
-        const dataUrl = canvas.toDataURL('image/jpeg', 0.85)
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.9)
         const base64  = dataUrl.split(',')[1]
 
-        // Safety guard: reject if somehow > 4 MB encoded (Anthropic limit is 5 MB)
+        // Debug: visible in browser console during development
+        console.log(
+          `[Vision] original=${img.naturalWidth}×${img.naturalHeight}`,
+          bounds
+            ? `crop=(${Math.round(srcX)},${Math.round(srcY)}) ${Math.round(srcW)}×${Math.round(srcH)}`
+            : 'crop=full',
+          `final=${dstW}×${dstH}`,
+          `b64=${(base64?.length ?? 0) > 0 ? ((base64.length / 1024).toFixed(0) + ' KB') : '—'}`,
+        )
+
+        // Safety guard: Anthropic limit is 5 MB decoded
         if (!base64 || base64.length > 4 * 1024 * 1024) { resolve(null); return }
 
         resolve({ base64, mimeType: 'image/jpeg' })
@@ -333,43 +364,78 @@ async function compressForVision(
   })
 }
 
-// Map a raw EdgeFunctionResponse to Partial<Contact>.
-// Fields not present in Contact (website, country, confidence, source, warnings)
-// are silently dropped — the user sees only the contact-relevant fields in review.
-function edgeResponseToContact(data: EdgeFunctionResponse): Partial<Contact> {
-  const clean: Partial<Contact> = {}
-  if (data.name?.trim())    clean.name    = data.name.trim()
-  if (data.email?.trim())   clean.email   = data.email.toLowerCase().trim()
-  if (data.phone?.trim())   clean.phone   = data.phone.trim()
-  if (data.company?.trim()) clean.company = data.company.trim()
-  if (data.role?.trim())    clean.role    = data.role.trim()
-  if (data.city?.trim())    clean.city    = data.city.trim()
-  return clean
+// Extra fields from Vision that don't map to the Contact schema.
+// Shown in the review UI for context; never written to the database.
+interface VisionExtra { website?: string; country?: string }
+
+// Debug-only metadata — shown in review during testing, not saved.
+interface ScanDebug {
+  source:     'vision' | 'ocr' | 'deterministic'
+  confidence: number | null
+  warnings:   string[]
 }
 
-// Call the edge function with the compressed image.
-// Returns null on any failure so the caller can fall back to OCR.
+interface VisionParseResult { fields: Partial<Contact>; extra: VisionExtra; debug: ScanDebug }
+
+// Map edge function response → Contact fields + Vision-only extras
+function edgeResponseToContact(data: EdgeFunctionResponse): { fields: Partial<Contact>; extra: VisionExtra } {
+  const fields: Partial<Contact> = {}
+  if (data.name?.trim())    fields.name    = data.name.trim()
+  if (data.email?.trim())   fields.email   = data.email.toLowerCase().trim()
+  if (data.phone?.trim())   fields.phone   = data.phone.trim()
+  if (data.company?.trim()) fields.company = data.company.trim()
+  if (data.role?.trim())    fields.role    = data.role.trim()
+  if (data.city?.trim())    fields.city    = data.city.trim()
+
+  const extra: VisionExtra = {}
+  if (data.website?.trim()) extra.website = data.website.trim()
+  if (data.country?.trim()) extra.country = data.country.trim()
+
+  return { fields, extra }
+}
+
+// Call the edge function with the compressed card image.
+// Returns null on any failure so the caller falls back to OCR.
+// All rejection reasons are logged for mobile testing visibility.
 async function tryVisionParse(
   file: File,
   bounds: CardBounds | null,
-): Promise<Partial<Contact> | null> {
+): Promise<VisionParseResult | null> {
   try {
     const compressed = await compressForVision(file, bounds)
-    if (!compressed) return null
+    if (!compressed) {
+      console.log('[Scanner] Vision rejected: image compression failed')
+      return null
+    }
 
     const { data, error } = await supabase.functions.invoke<EdgeFunctionResponse>(
       'parse-business-card',
       { body: { imageBase64: compressed.base64, mimeType: compressed.mimeType } },
     )
-    if (error || !data) return null
+    if (error || !data) {
+      console.log('[Scanner] Vision rejected: edge function error', error)
+      return null
+    }
 
-    // Reject low-confidence or empty results so the OCR fallback gets a chance
-    if (typeof data.confidence === 'number' && data.confidence < 0.3) return null
+    const confidence = typeof data.confidence === 'number' ? data.confidence : null
+    const warnings   = Array.isArray(data.warnings) ? data.warnings as string[] : []
 
-    const fields = edgeResponseToContact(data)
+    if (confidence !== null && confidence < 0.3) {
+      console.log(`[Scanner] Vision rejected: low confidence (${confidence.toFixed(2)})`, { warnings })
+      return null
+    }
+
+    const { fields, extra } = edgeResponseToContact(data)
     const hasIdentity = !!(fields.name || fields.company || fields.email || fields.phone)
-    return hasIdentity ? fields : null
-  } catch {
+    if (!hasIdentity) {
+      console.log('[Scanner] Vision rejected: no identity fields extracted', { fields, confidence, warnings })
+      return null
+    }
+
+    const debug: ScanDebug = { source: 'vision', confidence, warnings }
+    return { fields, extra, debug }
+  } catch (err) {
+    console.log('[Scanner] Vision rejected: exception', err)
     return null
   }
 }
@@ -443,17 +509,24 @@ function parseCard(rawText: string): Partial<Contact> {
 
 // ── AI parser ─────────────────────────────────────────────────────────────────
 
-async function parseWithAI(rawText: string): Promise<Partial<Contact> | null> {
+interface AiParseResult { fields: Partial<Contact> | null; debug: ScanDebug | null }
+
+async function parseWithAI(rawText: string): Promise<AiParseResult> {
   try {
     const { data, error } = await supabase.functions.invoke<EdgeFunctionResponse>(
       'parse-business-card',
       { body: { rawText: rawText.slice(0, 2000) } },
     )
-    if (error || !data) return null
-    const fields = edgeResponseToContact(data)
-    return Object.keys(fields).length > 0 ? fields : null
+    if (error || !data) return { fields: null, debug: null }
+    const { fields } = edgeResponseToContact(data)
+    const debug: ScanDebug = {
+      source:     'ocr',
+      confidence: typeof data.confidence === 'number' ? data.confidence : null,
+      warnings:   Array.isArray(data.warnings) ? data.warnings as string[] : [],
+    }
+    return { fields: Object.keys(fields).length > 0 ? fields : null, debug }
   } catch {
-    return null
+    return { fields: null, debug: null }
   }
 }
 
@@ -479,7 +552,9 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
   const [pendingBounds, setPendingBounds] = useState<CardBounds | null>(null)
   const [warningMsg, setWarningMsg]       = useState('')
   const [extracted, setExtracted]         = useState<Partial<Contact>>({})
+  const [extractedExtra, setExtractedExtra] = useState<VisionExtra>({})
   const [parsedByAI, setParsedByAI]       = useState(false)
+  const [scanDebug, setScanDebug]         = useState<ScanDebug | null>(null)   // debug only
   const [errorMsg, setErrorMsg]           = useState('')
 
   const cameraRef = useRef<HTMLInputElement>(null)
@@ -494,7 +569,9 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
     setPendingBounds(null)
     setWarningMsg('')
     setExtracted({})
+    setExtractedExtra({})
     setParsedByAI(false)
+    setScanDebug(null)
     setErrorMsg('')
   }
 
@@ -510,21 +587,32 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
 
     try {
       // ── Path 1: Vision (primary) ────────────────────────────────────────────
-      // Send compressed image directly to the edge function; Claude reads it visually.
-      // Much more accurate than OCR for business cards with complex layouts.
-      const visionFields = await tryVisionParse(file, bounds)
-      if (visionFields && hasAnyField(visionFields)) {
-        setExtracted(visionFields)
+      console.log('[Scanner] Vision attempt started', bounds
+        ? `bounds ${Math.round(bounds.w)}×${Math.round(bounds.h)} @ (${Math.round(bounds.x)},${Math.round(bounds.y)})`
+        : 'no crop bounds — full image')
+
+      const visionResult = await tryVisionParse(file, bounds)
+
+      if (visionResult && hasAnyField(visionResult.fields)) {
+        console.log('[Scanner] Vision success', {
+          source:     visionResult.debug.source,
+          confidence: visionResult.debug.confidence,
+          warnings:   visionResult.debug.warnings,
+          fields:     Object.keys(visionResult.fields),
+        })
+        setExtracted(visionResult.fields)
+        setExtractedExtra(visionResult.extra)
         setParsedByAI(true)
+        setScanDebug(visionResult.debug)
         setPhase('review')
         return
       }
 
       // ── Path 2: OCR fallback ─────────────────────────────────────────────────
-      // Vision unavailable, failed, low-confidence, or returned no identity fields.
-      // Fall back to the existing Tesseract → edge function text pipeline.
+      console.log('[Scanner] Vision produced no usable result — starting OCR fallback')
 
       // Step 1: crop + grayscale + contrast boost
+      console.log('[Scanner] OCR fallback: preprocessing image')
       setProcessingLabel('preprocessing')
       const processedBlob = await preprocessForOCR(file, bounds)
 
@@ -539,12 +627,23 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
       setProcessingLabel('reading')
       const { data: { text: rawText } } = await worker.recognize(processedBlob)
       await worker.terminate()
+      console.log(`[Scanner] OCR fallback: extracted ${rawText.length} chars`)
 
       // Step 3: edge function text parser → deterministic fallback
       setProcessingLabel('parsing')
-      const aiFields = await parseWithAI(rawText)
-      const usedAI   = aiFields !== null && hasAnyField(aiFields)
+      const { fields: aiFields, debug: aiDebug } = await parseWithAI(rawText)
+      const usedAI = aiFields !== null && hasAnyField(aiFields)
       const fields: Partial<Contact> = usedAI ? aiFields! : parseCard(rawText)
+
+      const finalDebug: ScanDebug = aiDebug ?? { source: 'deterministic', confidence: null, warnings: [] }
+      if (!usedAI) finalDebug.source = 'deterministic'
+
+      console.log('[Scanner] OCR fallback success', {
+        source:     finalDebug.source,
+        confidence: finalDebug.confidence,
+        usedAI,
+        fields:     Object.keys(fields),
+      })
 
       if (!hasAnyField(fields)) {
         setErrorMsg("Couldn't find recognisable contact fields. Try a clearer photo with the card filling more of the frame.")
@@ -554,9 +653,10 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
 
       setExtracted(fields)
       setParsedByAI(usedAI)
+      setScanDebug(finalDebug)
       setPhase('review')
     } catch (err) {
-      console.error('[BusinessCardScanner]', err)
+      console.error('[Scanner] Unhandled error', err)
       setErrorMsg('Something went wrong while reading the card. Please try again.')
       setPhase('error')
     }
@@ -719,12 +819,37 @@ export default function BusinessCardScanner({ onExtract }: BusinessCardScannerPr
                 </div>
               )
             })}
+            {/* Vision-only extras — shown for context, not saved to the contact */}
+            {extractedExtra.website && (
+              <div className="flex gap-3 min-w-0">
+                <dt className="text-xs text-zinc-400 dark:text-zinc-500 w-16 shrink-0 leading-5">Website</dt>
+                <dd className="text-sm text-zinc-700 dark:text-zinc-300 min-w-0 break-words leading-5">{extractedExtra.website}</dd>
+              </div>
+            )}
+            {extractedExtra.country && (
+              <div className="flex gap-3 min-w-0">
+                <dt className="text-xs text-zinc-400 dark:text-zinc-500 w-16 shrink-0 leading-5">Country</dt>
+                <dd className="text-sm text-zinc-700 dark:text-zinc-300 min-w-0 break-words leading-5">{extractedExtra.country}</dd>
+              </div>
+            )}
           </dl>
-          <p className="text-xs text-zinc-400 dark:text-zinc-500 mt-4 mb-3 leading-relaxed">
-            {parsedByAI
-              ? 'Parsed with AI — review and edit before saving.'
-              : 'Auto-detected — review and edit before saving.'}
-          </p>
+          <div className="mt-4 mb-3 space-y-0.5">
+            <p className="text-xs text-zinc-400 dark:text-zinc-500 leading-relaxed">
+              {parsedByAI ? 'Parsed with AI' : 'Auto-detected'}
+              {scanDebug && (
+                <span className="text-zinc-300 dark:text-zinc-600">
+                  {' · '}source: {scanDebug.source}
+                  {scanDebug.confidence !== null && ` · confidence: ${scanDebug.confidence.toFixed(2)}`}
+                </span>
+              )}
+              {' — review and edit before saving.'}
+            </p>
+            {scanDebug && scanDebug.warnings.length > 0 && (
+              <p className="text-xs text-zinc-300 dark:text-zinc-600 leading-relaxed">
+                {'⚠ '}{scanDebug.warnings.slice(0, 3).join(' · ')}
+              </p>
+            )}
+          </div>
           <div className="flex items-center gap-4">
             <button type="button" onClick={handleApply}
               className="rounded-xl bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 text-sm font-medium px-5 py-2.5 hover:bg-zinc-700 dark:hover:bg-zinc-300 active:scale-[0.98] transition-all">
