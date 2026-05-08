@@ -3,7 +3,11 @@
     "allow": [
       "Bash(npm install *)",
       "Bash(npx tsc *)",
-      "Bash(npm run *)"
+      "Bash(npm run *)",
+      "Bash(npm info *)",
+      "Bash(npm view *)",
+      "Bash(node -e \"const t = require\\('tesseract.js'\\); console.log\\(Object.keys\\(t\\)\\)\")",
+      "Bash(node -e \"const t = require\\('tesseract.js'\\); console.log\\(t.createWorker.toString\\(\\).slice\\(0,200\\)\\)\")"
     ]
   }
 }

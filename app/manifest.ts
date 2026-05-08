@@ -11,16 +11,18 @@ export default function manifest(): MetadataRoute.Manifest {
     theme_color: '#18181b',
     icons: [
       {
-        src: '/icon-192.png',
+        // Served by app/icon-192/route.tsx — purpose 'any' (non-adaptive)
+        src: '/icon-192',
         sizes: '192x192',
         type: 'image/png',
       },
       {
-        src: '/icon-512.png',
+        // Served by app/icon-512/route.tsx — maskable, elephant within safe zone
+        src: '/icon-512',
         sizes: '512x512',
         type: 'image/png',
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        purpose: 'any maskable' as any,
+        purpose: 'maskable' as any,
       },
     ],
   }

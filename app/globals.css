@@ -19,3 +19,21 @@ body {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
+
+/* ── Safe area support ────────────────────────────────────────────────────────
+   viewportFit: 'cover' in layout.tsx lets the app fill the full screen,
+   including the area under the notch / Dynamic Island (top) and home
+   indicator (bottom). These rules add the inset padding back where needed.
+
+   Unlayered author styles win over Tailwind's @layer utilities, so these
+   correctly override the py-10 / py-* classes applied in JSX. ── */
+
+nav {
+  /* Push nav content below the status bar / Dynamic Island in standalone mode */
+  padding-top: env(safe-area-inset-top, 0px);
+}
+
+main {
+  /* Keep content above the home indicator; preserve the existing 2.5 rem bottom padding */
+  padding-bottom: calc(2.5rem + env(safe-area-inset-bottom, 0px));
+}

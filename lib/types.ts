@@ -11,6 +11,7 @@ export type Contact = {
   familiarity: number | null
   origin_country: string | null
   origin_city: string | null
+  personal_context: string | null
   next_follow_up_date: string | null
   follow_up_note: string | null
   last_interaction_date: string | null
