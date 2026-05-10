@@ -10,7 +10,14 @@
       "Bash(node -e \"const t = require\\('tesseract.js'\\); console.log\\(t.createWorker.toString\\(\\).slice\\(0,200\\)\\)\")",
       "Bash(git rm *)",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(cat supabase/.temp/project-ref)",
+      "Bash(cat supabase/.temp/linked-project.json)",
+      "Bash(npx supabase *)",
+      "Read(//c/Users/labro/OneDrive/Έγγραφά/Claude/Claude Code/**)",
+      "Bash(grep -r \"ANTHROPIC\" --include=\"*.ts\" --include=\"*.tsx\" --include=\"*.js\" --include=\"*.env*\" --include=\"*.json\" -l)",
+      "Bash(curl -s -X POST https://mvgjzduafzpnlwvryshz.supabase.co/functions/v1/parse-business-card -H 'Authorization: Bearer sb_publishable_wzgtZN69oM-a3hCPbC3sdw_2VKk0XK6' -H 'Content-Type: application/json' -d '{\"rawText\": \"Alvaro Imaz\\\\nDirector General\\\\nMUPRO\\\\nalvaro.imaz@muepro.es\\\\n+34 916 321 755\"}')",
+      "Bash(git checkout *)"
     ]
   }
 }

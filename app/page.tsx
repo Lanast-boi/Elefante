@@ -59,7 +59,7 @@ export default function HomePage() {
   return (
     <div className="relative pb-24">
       {/* Sticky search */}
-      <div className="sticky top-14 z-10 bg-zinc-50 pt-2 pb-4 -mx-4 px-4">
+      <div className="sticky top-14 z-10 bg-zinc-50 dark:bg-zinc-950 pt-2 pb-4 -mx-4 px-4">
         <div className="relative">
           <input
             ref={searchRef}
@@ -67,12 +67,12 @@ export default function HomePage() {
             placeholder="Search people, companies, notes, places…"
             value={search}
             onChange={e => setSearch(e.target.value)}
-            className="w-full rounded-xl border border-zinc-200 bg-white px-4 py-3 pr-10 text-sm text-zinc-900 placeholder-zinc-400 outline-none focus:ring-2 focus:ring-zinc-900 focus:border-transparent transition shadow-sm"
+            className="w-full rounded-xl border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 px-4 py-3 pr-10 text-sm text-zinc-900 dark:text-zinc-100 placeholder-zinc-400 dark:placeholder-zinc-500 outline-none focus:ring-2 focus:ring-zinc-900 dark:focus:ring-zinc-400 focus:border-transparent transition shadow-sm"
           />
           {isSearching && (
             <button
               onClick={() => { setSearch(''); searchRef.current?.focus() }}
-              className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-700 transition-colors text-lg leading-none"
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 dark:text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 transition-colors text-lg leading-none"
               aria-label="Clear search"
             >
               ×
@@ -89,8 +89,8 @@ export default function HomePage() {
       {!loading && results !== null && (
         results.length === 0 ? (
           <div className="text-center py-16">
-            <p className="text-zinc-500 text-sm font-medium">No results for "{search}"</p>
-            <p className="text-zinc-400 text-xs mt-1">Try a name, company, tag, or something from your notes.</p>
+            <p className="text-zinc-500 dark:text-zinc-400 text-sm font-medium">No results for "{search}"</p>
+            <p className="text-zinc-400 dark:text-zinc-500 text-xs mt-1">Try a name, company, tag, or something from your notes.</p>
           </div>
         ) : (
           <Section title="Results" count={results.length}>
@@ -103,11 +103,11 @@ export default function HomePage() {
       {!loading && results === null && (
         contacts.length === 0 ? (
           <div className="text-center py-20">
-            <p className="text-zinc-500 font-medium">No contacts yet</p>
-            <p className="text-zinc-400 text-sm mt-1">Start building your network.</p>
+            <p className="text-zinc-500 dark:text-zinc-400 font-medium">No contacts yet</p>
+            <p className="text-zinc-400 dark:text-zinc-500 text-sm mt-1">Start building your network.</p>
             <Link
               href="/contacts/new"
-              className="inline-block mt-5 rounded-xl bg-zinc-900 text-white text-sm font-medium px-5 py-2.5 hover:bg-zinc-700 transition-colors"
+              className="inline-block mt-5 rounded-xl bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 text-sm font-medium px-5 py-2.5 hover:bg-zinc-700 dark:hover:bg-zinc-300 transition-colors"
             >
               Add first contact
             </Link>
@@ -135,10 +135,10 @@ export default function HomePage() {
         )
       )}
 
-      {/* Floating add button */}
+      {/* Floating add button — visible only on mobile (nav has + Add on desktop) */}
       <Link
         href="/contacts/new"
-        className="fixed bottom-6 right-6 z-50 w-14 h-14 bg-zinc-900 text-white text-2xl rounded-full flex items-center justify-center shadow-lg hover:bg-zinc-700 active:scale-95 transition-all"
+        className="fixed bottom-6 right-6 z-50 w-14 h-14 bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 text-2xl rounded-full flex items-center justify-center shadow-lg hover:bg-zinc-700 dark:hover:bg-zinc-300 active:scale-95 transition-all"
         aria-label="Add contact"
       >
         +
@@ -161,10 +161,16 @@ function Section({
   return (
     <section className="mb-8">
       <div className="flex items-center gap-2 mb-3">
-        <p className={`text-xs font-semibold uppercase tracking-widest ${variant === 'red' ? 'text-red-500' : 'text-zinc-400'}`}>
+        <p className={`text-xs font-semibold uppercase tracking-widest ${
+          variant === 'red' ? 'text-red-500 dark:text-red-400' : 'text-zinc-400 dark:text-zinc-500'
+        }`}>
           {title}
         </p>
-        <span className={`text-xs font-medium rounded-full px-2 py-0.5 ${variant === 'red' ? 'bg-red-50 text-red-500' : 'bg-zinc-100 text-zinc-500'}`}>
+        <span className={`text-xs font-medium rounded-full px-2 py-0.5 ${
+          variant === 'red'
+            ? 'bg-red-50 dark:bg-red-950/40 text-red-500 dark:text-red-400'
+            : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400'
+        }`}>
           {count}
         </span>
       </div>
