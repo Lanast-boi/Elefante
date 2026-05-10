@@ -7,6 +7,7 @@ type FormData = {
   name: string
   email: string
   phone: string
+  linkedin_url: string
   company: string
   role: string
   city: string
@@ -35,8 +36,17 @@ interface Props {
   submitLabel?: string
 }
 
-const inp = 'w-full rounded-xl border border-zinc-200 bg-white px-4 py-3 text-sm text-zinc-900 placeholder-zinc-400 outline-none focus:ring-2 focus:ring-zinc-900 focus:border-transparent transition'
-const lbl = 'text-xs font-medium text-zinc-400 uppercase tracking-wide mb-1.5 block'
+// Base input — theme-aware, used for all text/email/url/tel inputs
+const inp = [
+  'w-full rounded-xl border px-4 py-3 text-sm outline-none transition',
+  'border-zinc-200 dark:border-zinc-700',
+  'bg-white dark:bg-zinc-800',
+  'text-zinc-900 dark:text-zinc-100',
+  'placeholder-zinc-400 dark:placeholder-zinc-500',
+  'focus:ring-2 focus:ring-zinc-900 dark:focus:ring-zinc-400 focus:border-transparent',
+].join(' ')
+
+const lbl = 'text-xs font-medium text-zinc-400 dark:text-zinc-500 uppercase tracking-wide mb-1.5 block'
 
 const FAMILIARITY_OPTIONS = [
   { value: '1', label: '1', sub: 'Light' },
@@ -48,7 +58,7 @@ export default function ContactForm({ initial = {}, onSubmit, onCancel, submitLa
   const hasSecondaryValues = !!(
     initial.role || initial.city || initial.tags ||
     initial.how_we_met || initial.next_follow_up_date || initial.follow_up_note ||
-    initial.origin_country || initial.origin_city
+    initial.origin_country || initial.origin_city || initial.linkedin_url
   )
 
   const [where, how] = splitHowWeMet(initial.how_we_met)
@@ -56,6 +66,7 @@ export default function ContactForm({ initial = {}, onSubmit, onCancel, submitLa
     name: initial.name ?? '',
     email: initial.email ?? '',
     phone: initial.phone ?? '',
+    linkedin_url: initial.linkedin_url ?? '',
     company: initial.company ?? '',
     role: initial.role ?? '',
     city: initial.city ?? '',
@@ -111,12 +122,16 @@ export default function ContactForm({ initial = {}, onSubmit, onCancel, submitLa
               onClick={() => setForm(prev => ({ ...prev, familiarity: opt.value }))}
               className={`flex-1 py-2.5 rounded-xl border text-sm font-medium transition-all ${
                 form.familiarity === opt.value
-                  ? 'bg-zinc-900 border-zinc-900 text-white'
-                  : 'border-zinc-200 text-zinc-500 hover:border-zinc-400 hover:text-zinc-700'
+                  ? 'bg-zinc-900 dark:bg-zinc-100 border-zinc-900 dark:border-zinc-100 text-white dark:text-zinc-900'
+                  : 'border-zinc-200 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400 hover:border-zinc-400 dark:hover:border-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-200'
               }`}
             >
               {opt.label}
-              <span className={`block text-xs font-normal mt-0.5 ${form.familiarity === opt.value ? 'opacity-60' : 'text-zinc-400'}`}>
+              <span className={`block text-xs font-normal mt-0.5 ${
+                form.familiarity === opt.value
+                  ? 'opacity-60'
+                  : 'text-zinc-400 dark:text-zinc-500'
+              }`}>
                 {opt.sub}
               </span>
             </button>
@@ -144,15 +159,15 @@ export default function ContactForm({ initial = {}, onSubmit, onCancel, submitLa
 
       {/* — Secondary toggle — */}
       <div className="flex items-center gap-3">
-        <div className="flex-1 border-t border-zinc-100" />
+        <div className="flex-1 border-t border-zinc-100 dark:border-zinc-800" />
         <button
           type="button"
           onClick={() => setShowMore(v => !v)}
-          className="text-xs text-zinc-400 hover:text-zinc-700 transition-colors shrink-0 flex items-center gap-1"
+          className="text-xs text-zinc-400 dark:text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 transition-colors shrink-0 flex items-center gap-1"
         >
           {showMore ? 'Less details ↑' : 'More details ↓'}
         </button>
-        <div className="flex-1 border-t border-zinc-100" />
+        <div className="flex-1 border-t border-zinc-100 dark:border-zinc-800" />
       </div>
 
       {/* — Secondary fields — */}
@@ -217,7 +232,7 @@ export default function ContactForm({ initial = {}, onSubmit, onCancel, submitLa
           <div>
             <label className={lbl}>Next follow-up</label>
             <input
-              className="rounded-xl border border-zinc-200 bg-white px-4 py-3 text-sm text-zinc-900 outline-none focus:ring-2 focus:ring-zinc-900 focus:border-transparent transition"
+              className={inp}
               type="date"
               value={form.next_follow_up_date}
               onChange={set('next_follow_up_date')}
@@ -233,6 +248,18 @@ export default function ContactForm({ initial = {}, onSubmit, onCancel, submitLa
               placeholder="e.g. ask about Madrid project, send intro, check in"
             />
           </div>
+
+          <div>
+            <label className={lbl}>LinkedIn</label>
+            <input
+              className={inp}
+              value={form.linkedin_url}
+              onChange={set('linkedin_url')}
+              placeholder="linkedin.com/in/username"
+              type="url"
+              inputMode="url"
+            />
+          </div>
         </div>
       )}
 
@@ -241,7 +268,7 @@ export default function ContactForm({ initial = {}, onSubmit, onCancel, submitLa
         <button
           type="submit"
           disabled={loading}
-          className="w-full sm:w-auto rounded-xl bg-zinc-900 px-8 py-3 text-sm font-semibold text-white hover:bg-zinc-700 active:scale-[0.98] transition-all disabled:opacity-40"
+          className="w-full sm:w-auto rounded-xl bg-zinc-900 dark:bg-zinc-100 px-8 py-3 text-sm font-semibold text-white dark:text-zinc-900 hover:bg-zinc-700 dark:hover:bg-zinc-300 active:scale-[0.98] transition-all disabled:opacity-40"
         >
           {loading ? 'Saving…' : submitLabel}
         </button>
@@ -249,7 +276,7 @@ export default function ContactForm({ initial = {}, onSubmit, onCancel, submitLa
           <button
             type="button"
             onClick={onCancel}
-            className="w-full sm:w-auto rounded-xl border border-zinc-200 px-8 py-3 text-sm font-medium text-zinc-500 hover:bg-zinc-50 active:scale-[0.98] transition-all"
+            className="w-full sm:w-auto rounded-xl border border-zinc-200 dark:border-zinc-700 px-8 py-3 text-sm font-medium text-zinc-500 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-800 active:scale-[0.98] transition-all"
           >
             Cancel
           </button>

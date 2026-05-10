@@ -14,6 +14,12 @@ export function useTheme() {
 
 function applyTheme(t: Theme) {
   document.documentElement.classList.toggle('dark', t === 'dark')
+  // Keep <meta name="theme-color"> in sync so the iOS status bar and Android
+  // toolbar colour matches the actual theme, not just the system preference.
+  const color = t === 'dark' ? '#09090b' : '#fafafa'
+  document.querySelectorAll('meta[name="theme-color"]').forEach(el => {
+    el.setAttribute('content', color)
+  })
 }
 
 export default function ThemeProvider({ children }: { children: React.ReactNode }) {
