@@ -12,17 +12,18 @@ type ProcessingLabel = 'scanning' | 'preprocessing' | 'loading' | 'reading' | 'p
 
 // Unified response shape from the edge function
 interface EdgeFunctionResponse {
-  name?:        string | null
-  company?:     string | null
-  role?:        string | null
-  phone?:       string | null
-  email?:       string | null
-  website?:     string | null
-  city?:        string | null
-  country?:     string | null
-  confidence?:  number
-  source?:      'vision' | 'ocr'
-  warnings?:    string[]
+  name?:         string | null
+  company?:      string | null
+  role?:         string | null
+  phone?:        string | null
+  email?:        string | null
+  linkedin_url?: string | null
+  website?:      string | null
+  city?:         string | null
+  country?:      string | null
+  confidence?:   number
+  source?:       'vision' | 'ocr'
+  warnings?:     string[]
 }
 
 // ── Image analysis types ───────────────────────────────────────────────────────
@@ -380,12 +381,13 @@ interface VisionParseResult { fields: Partial<Contact>; extra: VisionExtra; debu
 // Map edge function response → Contact fields + Vision-only extras
 function edgeResponseToContact(data: EdgeFunctionResponse): { fields: Partial<Contact>; extra: VisionExtra } {
   const fields: Partial<Contact> = {}
-  if (data.name?.trim())    fields.name    = data.name.trim()
-  if (data.email?.trim())   fields.email   = data.email.toLowerCase().trim()
-  if (data.phone?.trim())   fields.phone   = data.phone.trim()
-  if (data.company?.trim()) fields.company = data.company.trim()
-  if (data.role?.trim())    fields.role    = data.role.trim()
-  if (data.city?.trim())    fields.city    = data.city.trim()
+  if (data.name?.trim())         fields.name         = data.name.trim()
+  if (data.email?.trim())        fields.email        = data.email.toLowerCase().trim()
+  if (data.phone?.trim())        fields.phone        = data.phone.trim()
+  if (data.linkedin_url?.trim()) fields.linkedin_url = data.linkedin_url.trim()
+  if (data.company?.trim())      fields.company      = data.company.trim()
+  if (data.role?.trim())         fields.role         = data.role.trim()
+  if (data.city?.trim())         fields.city         = data.city.trim()
 
   const extra: VisionExtra = {}
   if (data.website?.trim()) extra.website = data.website.trim()
@@ -413,9 +415,25 @@ async function tryVisionParse(
       { body: { imageBase64: compressed.base64, mimeType: compressed.mimeType } },
     )
     if (error || !data) {
-      console.log('[Scanner] Vision rejected: edge function error', error)
+      // Log HTTP status + message so we can distinguish 503 (no API key) from
+      // 502 (Anthropic error) from network failures
+      console.log('[Scanner] Vision rejected: edge function error', {
+        message: error?.message,
+        status:  (error as { context?: { status?: number } } | undefined)?.context?.status,
+        name:    error?.name,
+      })
       return null
     }
+    // Log the raw response so we can see if the API key was missing on the server
+    console.log('[Scanner] Vision edge function response:', {
+      source:     data.source,
+      confidence: data.confidence,
+      warnings:   data.warnings,
+      hasName:    !!data.name,
+      hasEmail:   !!data.email,
+      hasPhone:   !!data.phone,
+      hasCompany: !!data.company,
+    })
 
     const confidence = typeof data.confidence === 'number' ? data.confidence : null
     const warnings   = Array.isArray(data.warnings) ? data.warnings as string[] : []
@@ -533,9 +551,10 @@ async function parseWithAI(rawText: string): Promise<AiParseResult> {
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 const FIELD_LABELS: Partial<Record<keyof Contact, string>> = {
-  name: 'Name', email: 'Email', phone: 'Phone', company: 'Company', role: 'Role', city: 'City',
+  name: 'Name', email: 'Email', phone: 'Phone', linkedin_url: 'LinkedIn',
+  company: 'Company', role: 'Role', city: 'City',
 }
-const DISPLAYED_FIELDS: (keyof Contact)[] = ['name', 'email', 'phone', 'company', 'role', 'city']
+const DISPLAYED_FIELDS: (keyof Contact)[] = ['name', 'email', 'phone', 'linkedin_url', 'company', 'role', 'city']
 
 function hasAnyField(fields: Partial<Contact>): boolean {
   return DISPLAYED_FIELDS.some(k => fields[k])

@@ -231,6 +231,22 @@ export default function ContactDetailPage() {
               />
             )}
 
+            {contact.linkedin_url && (
+              <div>
+                <dt className="text-xs font-medium text-zinc-400 dark:text-zinc-500 uppercase tracking-wide mb-1">LinkedIn</dt>
+                <dd>
+                  <a
+                    href={contact.linkedin_url.startsWith('http') ? contact.linkedin_url : `https://${contact.linkedin_url}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-sm text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors"
+                  >
+                    {contact.linkedin_url.replace(/^https?:\/\/(www\.)?/, '')}
+                  </a>
+                </dd>
+              </div>
+            )}
+
             {contact.how_we_met && (() => {
               const idx = contact.how_we_met!.indexOf(' — ')
               const where = idx !== -1 ? contact.how_we_met!.slice(0, idx) : null

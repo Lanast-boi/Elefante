@@ -3,6 +3,7 @@ export type Contact = {
   name: string
   email: string | null
   phone: string | null
+  linkedin_url: string | null
   company: string | null
   role: string | null
   city: string | null

@@ -23,6 +23,7 @@ function autoDetect(headers: string[]): Mapping {
     origin_city: find(['origin city', 'hometown', 'city of origin', 'home city']),
     how_we_met: find(['how we met', 'how_we_met', 'source', 'where met']),
     tags: find(['tags', 'tag', 'labels', 'category', 'categories']),
+    linkedin_url: find(['linkedin', 'linkedin url', 'linkedin_url', 'linkedin profile', 'profile url', 'linkedin link']),
   }
 }
 
@@ -42,6 +43,7 @@ function buildContactRow(row: ParsedRow, mapping: Mapping, defaults: Defaults) {
     tags: get('tags') || null,
     email: get('email') || null,
     phone: get('phone') || null,
+    linkedin_url: get('linkedin_url') || null,
     familiarity: 1,
     updated_at: new Date().toISOString(),
   }

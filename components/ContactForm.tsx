@@ -7,6 +7,7 @@ type FormData = {
   name: string
   email: string
   phone: string
+  linkedin_url: string
   company: string
   role: string
   city: string
@@ -48,7 +49,7 @@ export default function ContactForm({ initial = {}, onSubmit, onCancel, submitLa
   const hasSecondaryValues = !!(
     initial.role || initial.city || initial.tags ||
     initial.how_we_met || initial.next_follow_up_date || initial.follow_up_note ||
-    initial.origin_country || initial.origin_city
+    initial.origin_country || initial.origin_city || initial.linkedin_url
   )
 
   const [where, how] = splitHowWeMet(initial.how_we_met)
@@ -56,6 +57,7 @@ export default function ContactForm({ initial = {}, onSubmit, onCancel, submitLa
     name: initial.name ?? '',
     email: initial.email ?? '',
     phone: initial.phone ?? '',
+    linkedin_url: initial.linkedin_url ?? '',
     company: initial.company ?? '',
     role: initial.role ?? '',
     city: initial.city ?? '',
@@ -231,6 +233,18 @@ export default function ContactForm({ initial = {}, onSubmit, onCancel, submitLa
               value={form.follow_up_note}
               onChange={set('follow_up_note')}
               placeholder="e.g. ask about Madrid project, send intro, check in"
+            />
+          </div>
+
+          <div>
+            <label className={lbl}>LinkedIn</label>
+            <input
+              className={inp}
+              value={form.linkedin_url}
+              onChange={set('linkedin_url')}
+              placeholder="linkedin.com/in/username"
+              type="url"
+              inputMode="url"
             />
           </div>
         </div>

@@ -46,17 +46,18 @@ interface DeterministicCandidates {
 
 // Unified response shape — both Vision and OCR paths return this
 interface ParsedFields {
-  name?:        string
-  company?:     string
-  role?:        string
-  phone?:       string
-  email?:       string
-  website?:     string
-  city?:        string
-  country?:     string
-  confidence:   number          // 0.0–1.0
-  source:       'vision' | 'ocr'
-  warnings:     string[]
+  name?:         string
+  company?:      string
+  role?:         string
+  phone?:        string
+  email?:        string
+  linkedin_url?: string
+  website?:      string
+  city?:         string
+  country?:      string
+  confidence:    number          // 0.0–1.0
+  source:        'vision' | 'ocr'
+  warnings:      string[]
 }
 
 // ── Constants ──────────────────────────────────────────────────────────────────
@@ -124,30 +125,32 @@ You extract contact information from business card images.
 
 Return ONLY a valid JSON object — no markdown, no code fences, nothing else:
 {
-  "name":       string | null,
-  "company":    string | null,
-  "role":       string | null,
-  "phone":      string | null,
-  "email":      string | null,
-  "website":    string | null,
-  "city":       string | null,
-  "country":    string | null,
-  "confidence": number,
-  "source":     "vision",
-  "warnings":   string[]
+  "name":         string | null,
+  "company":      string | null,
+  "role":         string | null,
+  "phone":        string | null,
+  "email":        string | null,
+  "linkedin_url": string | null,
+  "website":      string | null,
+  "city":         string | null,
+  "country":      string | null,
+  "confidence":   number,
+  "source":       "vision",
+  "warnings":     string[]
 }
 
 RULES
-name    — person's full name only; never the company name
-company — official organisation name; prefer with legal suffix (S.L., GmbH, Ltd, etc.)
-phone   — prefer mobile/direct; NEVER return a fax number unless it is the only number
-email   — as written; if the start is cut off and the name is visible, reconstruct it
-website — URL if present; omit https:// and www
-city    — city shown in address or clearly stated
-country — country if present or strongly implied by phone prefix or postal code
-confidence — 0.9+ clear card, 0.5–0.9 partial/uncertain, <0.5 poor quality
-warnings — list issues: "blurry", "partial card visible", "glare", etc.
-null    — use null (not empty string) for any field you cannot confidently identify`
+name         — person's full name only; never the company name
+company      — official organisation name; prefer with legal suffix (S.L., GmbH, Ltd, etc.)
+phone        — prefer mobile/direct; NEVER return a fax number unless it is the only number
+email        — as written; if the start is cut off and the name is visible, reconstruct it
+linkedin_url — full LinkedIn profile URL only if explicitly printed on the card (e.g. linkedin.com/in/username); never guess
+website      — URL if present; omit https:// and www; skip if it is a LinkedIn URL
+city         — city shown in address or clearly stated
+country      — country if present or strongly implied by phone prefix or postal code
+confidence   — 0.9+ clear card, 0.5–0.9 partial/uncertain, <0.5 poor quality
+warnings     — list issues: "blurry", "partial card visible", "glare", etc.
+null         — use null (not empty string) for any field you cannot confidently identify`
 
 // ── OCR text system prompt ─────────────────────────────────────────────────────
 
@@ -262,7 +265,7 @@ function cleanVisionResponse(raw: Record<string, unknown>): ParsedFields {
 
   const result: ParsedFields = { confidence, source: 'vision', warnings }
 
-  const STRING_FIELDS = ['name', 'company', 'role', 'phone', 'email', 'website', 'city', 'country'] as const
+  const STRING_FIELDS = ['name', 'company', 'role', 'phone', 'email', 'linkedin_url', 'website', 'city', 'country'] as const
 
   for (const key of STRING_FIELDS) {
     const val = raw[key]
@@ -451,7 +454,7 @@ function buildOcrPrompt(rawText: string, c: DeterministicCandidates): string {
 
 // ── OCR post-processing ────────────────────────────────────────────────────────
 
-const OCR_ALLOWED_FIELDS = ['name', 'email', 'phone', 'company', 'role', 'city'] as const
+const OCR_ALLOWED_FIELDS = ['name', 'email', 'phone', 'linkedin_url', 'company', 'role', 'city'] as const
 
 function postProcessOcr(
   raw: Record<string, unknown>,

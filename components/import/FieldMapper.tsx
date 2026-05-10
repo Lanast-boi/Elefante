@@ -1,6 +1,6 @@
 'use client'
 
-export type ElefeKey = 'name' | 'company' | 'role' | 'city' | 'origin_country' | 'origin_city' | 'how_we_met' | 'tags' | 'email' | 'phone'
+export type ElefeKey = 'name' | 'company' | 'role' | 'city' | 'origin_country' | 'origin_city' | 'how_we_met' | 'tags' | 'email' | 'phone' | 'linkedin_url'
 export type Mapping = Partial<Record<ElefeKey, string>>
 export interface Defaults { how_we_met: string }
 
@@ -15,6 +15,7 @@ const FIELDS: { key: ElefeKey; label: string; required?: boolean }[] = [
   { key: 'tags', label: 'Tags' },
   { key: 'email', label: 'Email' },
   { key: 'phone', label: 'Phone' },
+  { key: 'linkedin_url', label: 'LinkedIn URL' },
 ]
 
 interface Props {
