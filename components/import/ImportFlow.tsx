@@ -23,15 +23,24 @@ function autoDetect(headers: string[]): Mapping {
   const find  = (kw: string[]) => headers.find(h => kw.includes(lower(h)))
   return {
     name:           find(['name', 'full name', 'fullname', 'contact name', 'person']),
-    email:          find(['email', 'e-mail', 'email address']),
-    phone:          find(['phone', 'telephone', 'mobile', 'cell', 'phone number']),
-    company:        find(['company', 'organization', 'organisation', 'employer', 'firm']),
-    role:           find(['role', 'title', 'job title', 'position', 'job']),
+    // Google Contacts exports: "E-mail 1 - Value", "E-mail 2 - Value"
+    email:          find(['email', 'e-mail', 'email address',
+                          'e-mail 1 - value', 'e-mail 2 - value']),
+    // Google Contacts exports: "Phone 1 - Value", "Phone 2 - Value", "Mobile Phone"
+    phone:          find(['phone', 'telephone', 'mobile', 'cell', 'phone number',
+                          'phone 1 - value', 'phone 2 - value', 'mobile phone']),
+    // Google Contacts exports: "Organization 1 - Name"
+    company:        find(['company', 'organization', 'organisation', 'employer', 'firm',
+                          'organization 1 - name', 'organisation 1 - name']),
+    // Google Contacts exports: "Organization 1 - Title", "Occupation"
+    role:           find(['role', 'title', 'job title', 'position', 'job',
+                          'organization 1 - title', 'organisation 1 - title', 'occupation']),
     city:           find(['city', 'location', 'town']),
     origin_country: find(['origin country', 'country', 'nationality', 'country of origin', 'home country']),
     origin_city:    find(['origin city', 'hometown', 'city of origin', 'home city']),
     how_we_met:     find(['how we met', 'how_we_met', 'source', 'where met']),
-    tags:           find(['tags', 'tag', 'labels', 'category', 'categories']),
+    // Google Contacts exports: "Group Membership"
+    tags:           find(['tags', 'tag', 'labels', 'category', 'categories', 'group membership']),
     linkedin_url:   find(['linkedin', 'linkedin url', 'linkedin_url', 'linkedin profile', 'profile url', 'linkedin link']),
   }
 }
@@ -123,6 +132,26 @@ function buildDedupeMap(existing: ExistingContact[]): Map<string, ExistingContac
   for (const c of existing) {
     for (const k of dedupeKeys(c)) {
       if (!map.has(k)) map.set(k, c)
+    }
+  }
+  return map
+}
+
+// Secondary name-only lookup — used as a FALLBACK when primary keys (linkedin, email,
+// phone, name+company) all miss. Safe because we only match when the normalized name
+// is unique across all existing contacts.
+//
+// If two existing contacts share the same normalized name the value is set to 'ambiguous'
+// and that name will never be used for auto-matching, preventing false merges.
+function buildNameOnlyMap(existing: ExistingContact[]): Map<string, ExistingContact | 'ambiguous'> {
+  const map = new Map<string, ExistingContact | 'ambiguous'>()
+  for (const c of existing) {
+    const key = normStr(c.name)
+    if (!key) continue
+    if (map.has(key)) {
+      map.set(key, 'ambiguous')   // multiple contacts share this name → never auto-match
+    } else {
+      map.set(key, c)
     }
   }
   return map
@@ -225,32 +254,60 @@ export default function ImportFlow() {
     }
 
     const existingContacts = (existing ?? []) as ExistingContact[]
-    const dedupeMap  = buildDedupeMap(existingContacts)
-    const seenInFile = new Set<string>()  // grows as rows are processed
+    const dedupeMap    = buildDedupeMap(existingContacts)
+    const nameOnlyMap  = buildNameOnlyMap(existingContacts)
+    const seenInFile   = new Set<string>()  // grows as rows are processed
 
     const rows: ReviewRow[] = allRows.map(row => {
       const keys = dedupeKeys(row as DedupeRecord)
 
-      // Look for a match in existing contacts first
+      // ── Primary match: linkedin, email, phone, name+company ─────────────
       let matchedContact: ExistingContact | null = null
       for (const k of keys) {
         const m = dedupeMap.get(k)
         if (m) { matchedContact = m; break }
       }
 
-      // Intra-file duplicate: already seen in this file, not in existing
+      // ── Secondary match: unique normalized name (fallback) ───────────────
+      // Used only when primary keys all miss AND the name is unique in the DB.
+      // This catches the common case where LinkedIn and Google contacts have
+      // the same person under different company names.
+      if (!matchedContact) {
+        const nameKey  = normStr(row.name)
+        const nameHit  = nameOnlyMap.get(nameKey)
+        if (nameHit && nameHit !== 'ambiguous') {
+          matchedContact = nameHit
+        }
+      }
+
+      // ── Intra-file duplicate check ───────────────────────────────────────
       const isIntraFileDup = !matchedContact && keys.some(k => seenInFile.has(k))
       const isDuplicate    = !!matchedContact || isIntraFileDup
 
-      // Always register keys so later rows in the file see this one as taken
+      // Register keys so later rows in the file see this one as taken
       for (const k of keys) seenInFile.add(k)
 
       const enrichFields = matchedContact ? computeEnrichFields(matchedContact, row) : []
 
+      // ── Diagnostic logging (temporary — remove when stable) ─────────────
+      console.log('[Import Review]', row.name, {
+        importedPhone:   row.phone,
+        importedEmail:   row.email,
+        importedCompany: row.company,
+        importedLinkedin: row.linkedin_url,
+        dedupeKeys:      keys,
+        primaryMatch:    matchedContact?.name ?? null,
+        matchedPhone:    matchedContact?.phone ?? null,
+        matchedCompany:  matchedContact?.company ?? null,
+        enrichFields,
+        isDuplicate,
+        isIntraFileDup,
+      })
+
       // Default checked state:
       //   new contact               → checked (will create)
       //   matched + can enrich      → checked (will enrich)
-      //   matched + no new info     → unchecked (skip — nothing to do)
+      //   matched + no new info     → unchecked (skip)
       //   intra-file dup            → unchecked (skip)
       const checked = !isDuplicate || (!!matchedContact && enrichFields.length > 0)
 
