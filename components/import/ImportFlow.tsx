@@ -10,10 +10,10 @@ import FieldMapper, { Defaults, ElefeKey, Mapping } from './FieldMapper'
 type Step = 'upload' | 'preview' | 'map' | 'review' | 'importing' | 'done'
 
 interface ImportResult {
-  imported:   number
-  skipped:    number   // no-name rows + user-manually-unchecked non-duplicates
-  duplicates: number   // rows detected as duplicates (left unchecked)
-  failed:     number   // unexpected insert errors
+  imported:  number   // new contacts created
+  enriched:  number   // existing contacts that had empty fields filled
+  skipped:   number   // no-name rows + no-new-info duplicates + user-unchecked rows
+  failed:    number   // unexpected errors
 }
 
 // ── Field auto-detection ───────────────────────────────────────────────────────
@@ -61,31 +61,43 @@ function buildContactRow(row: ParsedRow, mapping: Mapping, defaults: Defaults) {
 type ContactRow = ReturnType<typeof buildContactRow>
 
 // ── Dedupe helpers ─────────────────────────────────────────────────────────────
-// Each record is represented by a small set of normalized lookup keys.
-// A row is a duplicate if ANY of its keys already appear in the dedupe set.
-//
-// Key types (checked in order, most → least reliable):
-//   li:<linkedin>        — stripped of protocol / www / trailing slash
-//   em:<email>           — lowercased
-//   nc:<name>|<company>  — lowercased, whitespace-collapsed
+// Keys (checked most → least reliable):
+//   li:<linkedin>  — stripped protocol/www/trailing slash
+//   em:<email>     — lowercased
+//   ph:<phone>     — digits only (stripped formatting)
+//   nc:<name>|<company> — lowercased, collapsed whitespace
 
 type DedupeRecord = {
   name:         string
   email:        string | null
+  phone:        string | null
   linkedin_url: string | null
   company:      string | null
+}
+
+// Full existing-contact shape fetched for enrichment decisions
+type ExistingContact = DedupeRecord & {
+  id:   string
+  role: string | null
+  city: string | null
 }
 
 function normLi(url: string | null | undefined): string {
   if (!url?.trim()) return ''
   return url.toLowerCase().trim()
-    .replace(/^https?:\/\//i, '')
-    .replace(/^www\./i, '')
-    .replace(/\/$/, '')
+    .replace(/^https?:\/\//i, '').replace(/^www\./i, '').replace(/\/$/, '')
 }
 
 function normEmail(email: string | null | undefined): string {
   return email?.toLowerCase().trim() ?? ''
+}
+
+function normPhone(phone: string | null | undefined): string {
+  if (!phone?.trim()) return ''
+  // Strip all formatting; keep digits and a leading +
+  const stripped = phone.trim().replace(/[\s\-\.\(\)]/g, '')
+  if (stripped.length < 7) return ''   // too short to be a real number
+  return stripped.toLowerCase()
 }
 
 function normStr(s: string | null | undefined): string {
@@ -96,25 +108,50 @@ function dedupeKeys(r: DedupeRecord): string[] {
   const keys: string[] = []
   const li = normLi(r.linkedin_url)
   const em = normEmail(r.email)
+  const ph = normPhone(r.phone)
   if (li) keys.push(`li:${li}`)
   if (em) keys.push(`em:${em}`)
+  if (ph) keys.push(`ph:${ph}`)
   keys.push(`nc:${normStr(r.name)}|${normStr(r.company)}`)
   return keys
 }
 
-function buildDedupeSet(existing: DedupeRecord[]): Set<string> {
-  const set = new Set<string>()
-  for (const c of existing) for (const k of dedupeKeys(c)) set.add(k)
-  return set
+// Map<key → ExistingContact> for O(1) match lookup that also returns WHICH contact matched.
+// First contact encountered for each key wins (handles rare multi-contact key collisions).
+function buildDedupeMap(existing: ExistingContact[]): Map<string, ExistingContact> {
+  const map = new Map<string, ExistingContact>()
+  for (const c of existing) {
+    for (const k of dedupeKeys(c)) {
+      if (!map.has(k)) map.set(k, c)
+    }
+  }
+  return map
+}
+
+// ── Enrichment helpers ─────────────────────────────────────────────────────────
+// Conservative: only fill fields that are empty/null in the existing contact.
+// Protected fields (name, familiarity, how_we_met, follow_up_*, personal_context,
+// notes) are intentionally absent from this list and cannot be touched.
+
+const ENRICHABLE_FIELDS = ['phone', 'email', 'company', 'role', 'linkedin_url', 'city'] as const
+type EnrichableField = typeof ENRICHABLE_FIELDS[number]
+
+function computeEnrichFields(existing: ExistingContact, incoming: ContactRow): EnrichableField[] {
+  return ENRICHABLE_FIELDS.filter(field => {
+    const existingVal = existing[field as keyof ExistingContact] as string | null | undefined
+    const incomingVal = incoming[field as keyof ContactRow] as string | null | undefined
+    return !existingVal && !!incomingVal   // existing is empty, import has data
+  })
 }
 
 // ── Review row ─────────────────────────────────────────────────────────────────
-// Wraps a built ContactRow with UI state for the review step.
 
 interface ReviewRow {
-  row:         ContactRow
-  isDuplicate: boolean
-  checked:     boolean   // false by default for duplicates; user can override
+  row:             ContactRow
+  isDuplicate:     boolean
+  matchedContact:  ExistingContact | null   // null for intra-file dups
+  enrichFields:    EnrichableField[]        // [] → "Already complete" or intra-file dup
+  checked:         boolean                  // true for new + enrichable; false otherwise
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -131,7 +168,7 @@ export default function ImportFlow() {
   const [noNameSkipped, setNoNameSkipped] = useState(0)
   const [loadingReview, setLoadingReview] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
-  const router = useRouter()
+  const router   = useRouter()
 
   // ── File handling ──────────────────────────────────────────────────────────
 
@@ -152,36 +189,33 @@ export default function ImportFlow() {
   }
 
   const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault()
-    setDragging(false)
+    e.preventDefault(); setDragging(false)
     const file = e.dataTransfer.files[0]
     if (file) void handleFile(file)
   }
 
-  // Count rows with a name (displayed on the map step button)
   const validCount = parsed && mapping.name
     ? parsed.rows.filter(r => (r[mapping.name!] ?? '').trim().length > 0).length
     : 0
 
   // ── Build review rows (map → review) ──────────────────────────────────────
-  // Fetches existing contacts from Supabase, runs dedupe, then shows review.
+  // Fetches all existing contacts, runs dedupe + enrichment analysis.
 
   const handleReview = async () => {
     if (!parsed || !mapping.name) return
     setError(null)
     setLoadingReview(true)
 
-    // Build candidate rows (must have a name)
     const allRows = parsed.rows
       .map(row => buildContactRow(row, mapping, defaults))
       .filter(row => row.name.length > 0)
 
     setNoNameSkipped(parsed.rows.length - allRows.length)
 
-    // Fetch existing contacts for deduplication
+    // Fetch existing contacts with all enrichable fields + id
     const { data: existing, error: fetchErr } = await supabase
       .from('contacts')
-      .select('name, email, linkedin_url, company')
+      .select('id, name, email, phone, linkedin_url, company, role, city')
 
     if (fetchErr) {
       console.error('[Import] Failed to fetch contacts for dedupe:', fetchErr)
@@ -190,17 +224,37 @@ export default function ImportFlow() {
       return
     }
 
-    // Build dedupe set from existing, then grow it with each accepted row
-    // so intra-file duplicates are also caught.
-    const dedupeSet  = buildDedupeSet((existing ?? []) as DedupeRecord[])
-    const seenInFile = new Set<string>()
+    const existingContacts = (existing ?? []) as ExistingContact[]
+    const dedupeMap  = buildDedupeMap(existingContacts)
+    const seenInFile = new Set<string>()  // grows as rows are processed
 
     const rows: ReviewRow[] = allRows.map(row => {
-      const keys        = dedupeKeys(row as DedupeRecord)
-      const isDuplicate = keys.some(k => dedupeSet.has(k) || seenInFile.has(k))
-      // Register keys so later rows in the file see this one as existing
-      if (!isDuplicate) for (const k of keys) seenInFile.add(k)
-      return { row, isDuplicate, checked: !isDuplicate }
+      const keys = dedupeKeys(row as DedupeRecord)
+
+      // Look for a match in existing contacts first
+      let matchedContact: ExistingContact | null = null
+      for (const k of keys) {
+        const m = dedupeMap.get(k)
+        if (m) { matchedContact = m; break }
+      }
+
+      // Intra-file duplicate: already seen in this file, not in existing
+      const isIntraFileDup = !matchedContact && keys.some(k => seenInFile.has(k))
+      const isDuplicate    = !!matchedContact || isIntraFileDup
+
+      // Always register keys so later rows in the file see this one as taken
+      for (const k of keys) seenInFile.add(k)
+
+      const enrichFields = matchedContact ? computeEnrichFields(matchedContact, row) : []
+
+      // Default checked state:
+      //   new contact               → checked (will create)
+      //   matched + can enrich      → checked (will enrich)
+      //   matched + no new info     → unchecked (skip — nothing to do)
+      //   intra-file dup            → unchecked (skip)
+      const checked = !isDuplicate || (!!matchedContact && enrichFields.length > 0)
+
+      return { row, isDuplicate, matchedContact, enrichFields, checked }
     })
 
     setReviewRows(rows)
@@ -208,31 +262,81 @@ export default function ImportFlow() {
     setStep('review')
   }
 
-  // ── Insert from review step ────────────────────────────────────────────────
+  // ── Execute import from review step ───────────────────────────────────────
+  // Separates rows into: create, enrich (by existing contact id), skip.
+  // Enrichment is deduplicated by id — if the same existing contact appears
+  // multiple times in the file, it is only updated once.
 
   const handleImport = async () => {
     setError(null)
     setStep('importing')
 
-    const toInsert   = reviewRows.filter(r =>  r.checked).map(r => r.row)
-    const dupSkipped = reviewRows.filter(r => !r.checked &&  r.isDuplicate).length
-    const usrSkipped = reviewRows.filter(r => !r.checked && !r.isDuplicate).length
+    const toCreate: ContactRow[] = []
+    const enrichById = new Map<string, Record<string, unknown>>()   // id → patch
+    let dupSkipped = 0
+    let usrSkipped = 0
 
-    if (toInsert.length === 0) {
-      setResult({ imported: 0, skipped: noNameSkipped + usrSkipped, duplicates: dupSkipped, failed: 0 })
-      setStep('done')
-      return
+    for (const item of reviewRows) {
+      if (!item.checked) {
+        if (item.isDuplicate) dupSkipped++
+        else                  usrSkipped++
+        continue
+      }
+
+      if (!item.isDuplicate) {
+        // Brand-new contact
+        toCreate.push(item.row)
+      } else if (item.matchedContact && item.enrichFields.length > 0) {
+        // Enrich existing contact — deduplicated by id
+        if (!enrichById.has(item.matchedContact.id)) {
+          const patch: Record<string, unknown> = { updated_at: new Date().toISOString() }
+          for (const field of item.enrichFields) {
+            const val = (item.row as Record<string, unknown>)[field]
+            if (val) patch[field] = val
+          }
+          enrichById.set(item.matchedContact.id, patch)
+        }
+      } else {
+        // Checked but nothing to do (intra-file dup or no enrichable fields)
+        dupSkipped++
+      }
     }
 
-    const { error: insertErr } = await supabase.from('contacts').insert(toInsert)
-    if (insertErr) {
-      console.error('[Import] Insert error:', insertErr)
-      setError(insertErr.message)
-      setStep('review')   // keep selections intact, let user retry
-      return
+    // ── 1. Insert new contacts ─────────────────────────────────────────────
+    let inserted = 0
+    if (toCreate.length > 0) {
+      const { error: insertErr } = await supabase.from('contacts').insert(toCreate)
+      if (insertErr) {
+        console.error('[Import] Insert error:', insertErr)
+        setError(insertErr.message)
+        setStep('review')   // preserve checkbox state
+        return
+      }
+      inserted = toCreate.length
     }
 
-    setResult({ imported: toInsert.length, skipped: noNameSkipped + usrSkipped, duplicates: dupSkipped, failed: 0 })
+    // ── 2. Enrich existing contacts ────────────────────────────────────────
+    // Each update is a separate call that only touches the patch fields.
+    // On error: log and continue — partial enrichment is better than none.
+    let enriched = 0
+    for (const [id, patch] of enrichById) {
+      const { error: updateErr } = await supabase
+        .from('contacts')
+        .update(patch)
+        .eq('id', id)
+      if (updateErr) {
+        console.error('[Import] Enrich error for contact', id, updateErr)
+      } else {
+        enriched++
+      }
+    }
+
+    setResult({
+      imported: inserted,
+      enriched,
+      skipped:  noNameSkipped + usrSkipped + dupSkipped,
+      failed:   0,
+    })
     setStep('done')
   }
 
@@ -244,30 +348,36 @@ export default function ImportFlow() {
   const selectAll = () =>
     setReviewRows(prev => prev.map(r => ({ ...r, checked: true })))
 
-  const skipDuplicates = () =>
-    setReviewRows(prev => prev.map(r => ({ ...r, checked: !r.isDuplicate })))
+  // Enrich-only: check new + check enrichable matches; uncheck no-new-info
+  const enrichOnly = () =>
+    setReviewRows(prev => prev.map(r => ({
+      ...r,
+      checked: !r.isDuplicate || (!!r.matchedContact && r.enrichFields.length > 0),
+    })))
 
-  // Derived counts for the review header
-  const checkedCount  = reviewRows.filter(r =>  r.checked).length
-  const dupCount      = reviewRows.filter(r =>  r.isDuplicate).length
-  const readyCount    = reviewRows.filter(r => !r.isDuplicate).length
+  const skipAll = () =>
+    setReviewRows(prev => prev.map(r => ({ ...r, checked: false })))
+
+  // Derived counts
+  const newCount        = reviewRows.filter(r => !r.isDuplicate).length
+  const canEnrichCount  = reviewRows.filter(r => r.isDuplicate && r.matchedContact && r.enrichFields.length > 0).length
+  const noNewInfoCount  = reviewRows.filter(r => r.isDuplicate && r.enrichFields.length === 0).length
+  const checkedCount    = reviewRows.filter(r => r.checked).length
 
   // ── Done ───────────────────────────────────────────────────────────────────
   if (step === 'done' && result) {
     const parts: string[] = []
-    if (result.imported   > 0) parts.push(`${result.imported} contact${result.imported !== 1 ? 's' : ''} imported`)
-    if (result.duplicates > 0) parts.push(`${result.duplicates} duplicate${result.duplicates !== 1 ? 's' : ''} skipped`)
-    if (result.skipped    > 0) parts.push(`${result.skipped} row${result.skipped !== 1 ? 's' : ''} skipped`)
-    if (result.failed     > 0) parts.push(`${result.failed} failed`)
+    if (result.imported > 0) parts.push(`${result.imported} contact${result.imported !== 1 ? 's' : ''} created`)
+    if (result.enriched > 0) parts.push(`${result.enriched} enriched`)
+    if (result.skipped  > 0) parts.push(`${result.skipped} skipped`)
+    if (result.failed   > 0) parts.push(`${result.failed} failed`)
     const summary = parts.join(' · ') || 'Nothing to import'
 
     return (
       <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-zinc-100 dark:border-zinc-800 shadow-sm p-10 text-center">
-        <div className="w-12 h-12 rounded-full bg-zinc-100 dark:bg-zinc-800 flex items-center justify-center mx-auto mb-5 text-2xl">
-          ✓
-        </div>
+        <div className="w-12 h-12 rounded-full bg-zinc-100 dark:bg-zinc-800 flex items-center justify-center mx-auto mb-5 text-2xl">✓</div>
         <h2 className="text-xl font-semibold text-zinc-900 dark:text-zinc-100 mb-1">
-          {result.imported === 0 && result.duplicates > 0 ? 'Nothing new to import' : 'Import complete'}
+          {result.imported === 0 && result.enriched === 0 ? 'Nothing new to import' : 'Import complete'}
         </h2>
         <p className="text-sm text-zinc-400 mb-8">{summary}</p>
         <div className="flex gap-3 justify-center flex-wrap">
@@ -331,7 +441,7 @@ export default function ImportFlow() {
         </div>
       )}
 
-      {/* ── Preview (raw data table) ──────────────────────────────────────── */}
+      {/* ── Preview ──────────────────────────────────────────────────────── */}
       {step === 'preview' && parsed && (
         <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-zinc-100 dark:border-zinc-800 shadow-sm overflow-hidden">
           <div className="px-6 py-4 border-b border-zinc-100 dark:border-zinc-800 flex items-center justify-between gap-4">
@@ -342,15 +452,12 @@ export default function ImportFlow() {
               <p className="text-xs text-zinc-400 mt-0.5">Showing first 20 · {parsed.headers.length} columns</p>
             </div>
           </div>
-
           <div className="overflow-x-auto max-h-[400px] overflow-y-auto">
             <table className="w-full text-xs">
               <thead className="sticky top-0 z-10">
                 <tr className="bg-zinc-50 dark:bg-zinc-800/60">
                   {parsed.headers.map(h => (
-                    <th key={h} className="px-4 py-2.5 text-left font-medium text-zinc-500 dark:text-zinc-400 whitespace-nowrap border-b border-zinc-100 dark:border-zinc-800">
-                      {h}
-                    </th>
+                    <th key={h} className="px-4 py-2.5 text-left font-medium text-zinc-500 dark:text-zinc-400 whitespace-nowrap border-b border-zinc-100 dark:border-zinc-800">{h}</th>
                   ))}
                 </tr>
               </thead>
@@ -367,20 +474,9 @@ export default function ImportFlow() {
               </tbody>
             </table>
           </div>
-
           <div className="px-6 py-4 flex items-center justify-between gap-3 border-t border-zinc-100 dark:border-zinc-800">
-            <button
-              onClick={() => { setStep('upload'); setParsed(null) }}
-              className="text-sm text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-300 transition-colors"
-            >
-              ← Back
-            </button>
-            <button
-              onClick={() => setStep('map')}
-              className="rounded-xl bg-zinc-900 dark:bg-zinc-100 px-5 py-2 text-sm font-medium text-white dark:text-zinc-900 hover:bg-zinc-700 dark:hover:bg-zinc-300 transition-colors"
-            >
-              Continue →
-            </button>
+            <button onClick={() => { setStep('upload'); setParsed(null) }} className="text-sm text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-300 transition-colors">← Back</button>
+            <button onClick={() => setStep('map')} className="rounded-xl bg-zinc-900 dark:bg-zinc-100 px-5 py-2 text-sm font-medium text-white dark:text-zinc-900 hover:bg-zinc-700 dark:hover:bg-zinc-300 transition-colors">Continue →</button>
           </div>
         </div>
       )}
@@ -392,28 +488,13 @@ export default function ImportFlow() {
             <p className="text-sm font-medium text-zinc-900 dark:text-zinc-100">Map columns to Elefante fields</p>
             <p className="text-xs text-zinc-400 mt-0.5">Name is required. Everything else is optional.</p>
           </div>
-
           <div className="px-6 py-5">
-            <FieldMapper
-              headers={parsed.headers}
-              mapping={mapping}
-              onChange={setMapping}
-              defaults={defaults}
-              onDefaultsChange={setDefaults}
-            />
+            <FieldMapper headers={parsed.headers} mapping={mapping} onChange={setMapping} defaults={defaults} onDefaultsChange={setDefaults} />
           </div>
-
           <div className="px-6 py-4 flex items-center justify-between gap-3 border-t border-zinc-100 dark:border-zinc-800 flex-wrap">
-            <button
-              onClick={() => setStep('preview')}
-              className="text-sm text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-300 transition-colors"
-            >
-              ← Back
-            </button>
+            <button onClick={() => setStep('preview')} className="text-sm text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-300 transition-colors">← Back</button>
             <div className="flex items-center gap-3">
-              {!mapping.name && (
-                <p className="text-xs text-zinc-400">Map "Name" to continue</p>
-              )}
+              {!mapping.name && <p className="text-xs text-zinc-400">Map "Name" to continue</p>}
               <button
                 onClick={() => void handleReview()}
                 disabled={!mapping.name || validCount === 0 || loadingReview}
@@ -429,119 +510,134 @@ export default function ImportFlow() {
       {/* ── Review ───────────────────────────────────────────────────────── */}
       {step === 'review' && (
         <div>
-          {/* Header bar: counts + bulk actions */}
+          {/* Header: counts + bulk actions */}
           <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-zinc-100 dark:border-zinc-800 shadow-sm px-5 py-4 mb-3">
             <div className="flex items-center justify-between gap-3 flex-wrap">
-              {/* Live counts */}
+              {/* Live summary */}
               <p className="text-sm text-zinc-500 dark:text-zinc-400">
                 <span className="font-medium text-zinc-900 dark:text-zinc-100">{checkedCount}</span> ready
-                {dupCount > 0 && (
-                  <> · <span className="text-amber-500">{dupCount}</span> duplicate{dupCount !== 1 ? 's' : ''}</>
-                )}
-                {noNameSkipped > 0 && (
-                  <> · <span className="text-zinc-400">{noNameSkipped}</span> skipped (no name)</>
-                )}
+                {noNameSkipped > 0 && <> · <span className="text-zinc-400">{noNameSkipped}</span> skipped (no name)</>}
               </p>
-
               {/* Bulk controls */}
               <div className="flex items-center gap-1">
-                <button
-                  onClick={selectAll}
-                  className="text-xs text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 px-2.5 py-1.5 rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
-                >
-                  Select all
-                </button>
-                {dupCount > 0 && (
-                  <button
-                    onClick={skipDuplicates}
-                    className="text-xs text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 px-2.5 py-1.5 rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
-                  >
-                    Skip duplicates
-                  </button>
+                <button onClick={selectAll}  className="text-xs text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 px-2.5 py-1.5 rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors">Select all</button>
+                {(canEnrichCount > 0 || noNewInfoCount > 0) && (
+                  <button onClick={enrichOnly} className="text-xs text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 px-2.5 py-1.5 rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors">Enrich only</button>
                 )}
+                <button onClick={skipAll} className="text-xs text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 px-2.5 py-1.5 rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors">Skip all</button>
               </div>
             </div>
 
-            {/* Compact stats pills */}
-            {(readyCount > 0 || dupCount > 0) && (
+            {/* Stats pills */}
+            {(newCount > 0 || canEnrichCount > 0 || noNewInfoCount > 0) && (
               <div className="flex flex-wrap gap-1.5 mt-3">
-                {readyCount > 0 && (
-                  <span className="text-xs bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 rounded-full px-2.5 py-0.5">
-                    {readyCount} new
-                  </span>
+                {newCount > 0 && (
+                  <span className="text-xs bg-zinc-100 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 rounded-full px-2.5 py-0.5">{newCount} new</span>
                 )}
-                {dupCount > 0 && (
-                  <span className="text-xs bg-amber-50 dark:bg-amber-950/40 text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-900/50 rounded-full px-2.5 py-0.5">
-                    {dupCount} already in Elefante
-                  </span>
+                {canEnrichCount > 0 && (
+                  <span className="text-xs bg-blue-50 dark:bg-blue-950/40 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-900/50 rounded-full px-2.5 py-0.5">{canEnrichCount} can enrich</span>
+                )}
+                {noNewInfoCount > 0 && (
+                  <span className="text-xs bg-zinc-50 dark:bg-zinc-800/60 text-zinc-400 dark:text-zinc-500 border border-zinc-200 dark:border-zinc-700 rounded-full px-2.5 py-0.5">{noNewInfoCount} no new info</span>
                 )}
               </div>
             )}
           </div>
 
-          {/* Row cards — scrollable */}
+          {/* Row cards */}
           <div className="flex flex-col gap-2 max-h-[60vh] overflow-y-auto pb-1">
-            {reviewRows.map((item, i) => (
-              <button
-                key={i}
-                type="button"
-                onClick={() => toggleRow(i)}
-                className={`w-full text-left flex items-start gap-3 rounded-2xl border px-4 py-3.5 transition-all ${
-                  item.checked
-                    ? 'bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-700 hover:border-zinc-300 dark:hover:border-zinc-600'
-                    : 'bg-zinc-50/70 dark:bg-zinc-900/40 border-zinc-100 dark:border-zinc-800 opacity-60 hover:opacity-80'
-                }`}
-              >
-                {/* Checkbox */}
-                <div className={`mt-0.5 w-5 h-5 rounded-md border-2 flex-shrink-0 flex items-center justify-center transition-colors ${
-                  item.checked
-                    ? 'bg-zinc-900 dark:bg-zinc-100 border-zinc-900 dark:border-zinc-100'
-                    : 'border-zinc-300 dark:border-zinc-600'
-                }`}>
-                  {item.checked && (
-                    <svg viewBox="0 0 12 12" fill="none" className="w-3 h-3 text-white dark:text-zinc-900" aria-hidden="true">
-                      <path d="M2 6l3 3 5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
-                    </svg>
-                  )}
-                </div>
+            {reviewRows.map((item, i) => {
+              const isNew        = !item.isDuplicate
+              const canEnrich    = item.isDuplicate && item.matchedContact && item.enrichFields.length > 0
+              const noNewInfo    = item.isDuplicate && item.enrichFields.length === 0
 
-                {/* Contact info */}
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 flex-wrap">
-                    <span className="text-sm font-medium text-zinc-900 dark:text-zinc-100 truncate">
-                      {item.row.name}
-                    </span>
-                    {item.isDuplicate && (
-                      <span className="flex-shrink-0 text-xs bg-amber-50 dark:bg-amber-950/40 text-amber-600 dark:text-amber-400 border border-amber-200 dark:border-amber-900/50 rounded-full px-2 py-px">
-                        Duplicate
-                      </span>
+              return (
+                <button
+                  key={i}
+                  type="button"
+                  onClick={() => toggleRow(i)}
+                  className={`w-full text-left flex items-start gap-3 rounded-2xl border px-4 py-3.5 transition-all ${
+                    item.checked
+                      ? 'bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-700 hover:border-zinc-300 dark:hover:border-zinc-600'
+                      : 'bg-zinc-50/70 dark:bg-zinc-900/40 border-zinc-100 dark:border-zinc-800 opacity-60 hover:opacity-80'
+                  }`}
+                >
+                  {/* Checkbox */}
+                  <div className={`mt-0.5 w-5 h-5 rounded-md border-2 flex-shrink-0 flex items-center justify-center transition-colors ${
+                    item.checked
+                      ? 'bg-zinc-900 dark:bg-zinc-100 border-zinc-900 dark:border-zinc-100'
+                      : 'border-zinc-300 dark:border-zinc-600'
+                  }`}>
+                    {item.checked && (
+                      <svg viewBox="0 0 12 12" fill="none" className="w-3 h-3 text-white dark:text-zinc-900" aria-hidden="true">
+                        <path d="M2 6l3 3 5-5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/>
+                      </svg>
                     )}
                   </div>
 
-                  {(item.row.role || item.row.company) && (
-                    <p className="text-xs text-zinc-400 dark:text-zinc-500 mt-0.5 truncate">
-                      {[item.row.role, item.row.company].filter(Boolean).join(' · ')}
-                    </p>
-                  )}
+                  {/* Content */}
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-sm font-medium text-zinc-900 dark:text-zinc-100 truncate">{item.row.name}</span>
 
-                  {item.row.linkedin_url && (
-                    <p className="text-xs text-zinc-300 dark:text-zinc-600 mt-0.5 truncate">
-                      {item.row.linkedin_url.replace(/^https?:\/\/(www\.)?/i, '')}
-                    </p>
-                  )}
-                </div>
-              </button>
-            ))}
+                      {/* Status badge */}
+                      {canEnrich && (
+                        <span className="flex-shrink-0 text-xs bg-blue-50 dark:bg-blue-950/40 text-blue-600 dark:text-blue-400 border border-blue-200 dark:border-blue-900/50 rounded-full px-2 py-px">
+                          Can enrich
+                        </span>
+                      )}
+                      {noNewInfo && item.matchedContact && (
+                        <span className="flex-shrink-0 text-xs bg-zinc-100 dark:bg-zinc-800 text-zinc-400 dark:text-zinc-500 rounded-full px-2 py-px">
+                          Already complete
+                        </span>
+                      )}
+                      {noNewInfo && !item.matchedContact && (
+                        <span className="flex-shrink-0 text-xs bg-zinc-100 dark:bg-zinc-800 text-zinc-400 dark:text-zinc-500 rounded-full px-2 py-px">
+                          Duplicate in file
+                        </span>
+                      )}
+                    </div>
+
+                    {/* Role / company */}
+                    {(item.row.role || item.row.company) && (
+                      <p className="text-xs text-zinc-400 dark:text-zinc-500 mt-0.5 truncate">
+                        {[item.row.role, item.row.company].filter(Boolean).join(' · ')}
+                      </p>
+                    )}
+
+                    {/* For enrichable matches: show what will be added */}
+                    {canEnrich && item.enrichFields.length > 0 && (
+                      <p className="text-xs text-blue-500 dark:text-blue-400 mt-1">
+                        Adds: {item.enrichFields.map(f => {
+                          const labels: Record<string, string> = {
+                            phone: 'phone', email: 'email', company: 'company',
+                            role: 'role', linkedin_url: 'LinkedIn', city: 'city',
+                          }
+                          return labels[f] ?? f
+                        }).join(', ')}
+                      </p>
+                    )}
+
+                    {/* For new rows: LinkedIn URL preview */}
+                    {isNew && item.row.linkedin_url && (
+                      <p className="text-xs text-zinc-300 dark:text-zinc-600 mt-0.5 truncate">
+                        {item.row.linkedin_url.replace(/^https?:\/\/(www\.)?/i, '')}
+                      </p>
+                    )}
+
+                    {/* For new rows: phone preview */}
+                    {isNew && item.row.phone && (
+                      <p className="text-xs text-zinc-300 dark:text-zinc-600 mt-0.5">{item.row.phone}</p>
+                    )}
+                  </div>
+                </button>
+              )
+            })}
           </div>
 
-          {/* Footer: back + import CTA */}
+          {/* Footer */}
           <div className="flex items-center justify-between gap-3 pt-4">
-            <button
-              onClick={() => setStep('map')}
-              className="text-sm text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-300 transition-colors"
-            >
-              ← Back
-            </button>
+            <button onClick={() => setStep('map')} className="text-sm text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-300 transition-colors">← Back</button>
             <button
               onClick={() => void handleImport()}
               disabled={checkedCount === 0}
