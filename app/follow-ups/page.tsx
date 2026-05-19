@@ -11,18 +11,37 @@ export default function FollowUpsPage() {
 
   useEffect(() => {
     const load = async () => {
-      const { data, error: err } = await supabase
-        .from('contacts')
-        .select('*')
-        .not('next_follow_up_date', 'is', null)
-        .order('next_follow_up_date')
-      if (err) {
-        console.error('Failed to load follow-ups:', err.message)
-        setError(err.message)
-      } else {
-        setContacts(data || [])
+      // Batch through Supabase's 1,000-row limit so follow-ups are never truncated.
+      const BATCH_SIZE = 1000
+      const all: Contact[] = []
+      let from = 0
+
+      try {
+        while (true) {
+          const { data, error: err } = await supabase
+            .from('contacts')
+            .select('*')
+            .not('next_follow_up_date', 'is', null)
+            .order('next_follow_up_date')
+            .range(from, from + BATCH_SIZE - 1)
+
+          if (err) throw err
+          if (!data || data.length === 0) break
+
+          all.push(...(data as Contact[]))
+
+          if (data.length < BATCH_SIZE) break
+          from += BATCH_SIZE
+        }
+
+        setContacts(all)
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err)
+        console.error('Failed to load follow-ups:', msg)
+        setError(msg)
+      } finally {
+        setLoading(false)
       }
-      setLoading(false)
     }
     load()
   }, [])
