@@ -25,6 +25,34 @@ function sortAll(contacts: ContactWithNotes[]): ContactWithNotes[] {
   })
 }
 
+// Fetch every contact by paging through Supabase's 1,000-row default limit.
+// Each call to .range(from, to) returns at most 1,000 rows; we keep requesting
+// the next window until a batch comes back smaller than BATCH_SIZE, which means
+// we've reached the end of the table. No config change required — scales to any size.
+async function fetchAllContacts(): Promise<ContactWithNotes[]> {
+  const BATCH_SIZE = 1000
+  const all: ContactWithNotes[] = []
+  let from = 0
+
+  while (true) {
+    const { data, error } = await supabase
+      .from('contacts')
+      .select('*, notes(text)')
+      .order('name')
+      .range(from, from + BATCH_SIZE - 1)
+
+    if (error) throw error
+    if (!data || data.length === 0) break
+
+    all.push(...(data as ContactWithNotes[]))
+
+    if (data.length < BATCH_SIZE) break   // last batch — no more rows
+    from += BATCH_SIZE
+  }
+
+  return all
+}
+
 export default function HomePage() {
   const [contacts, setContacts] = useState<ContactWithNotes[]>([])
   const [search, setSearch] = useState('')
@@ -33,12 +61,14 @@ export default function HomePage() {
 
   useEffect(() => {
     const load = async () => {
-      const { data } = await supabase
-        .from('contacts')
-        .select('*, notes(text)')
-        .order('name')
-      setContacts((data as ContactWithNotes[]) || [])
-      setLoading(false)
+      try {
+        const all = await fetchAllContacts()
+        setContacts(all)
+      } catch (err) {
+        console.error('[Contacts] Failed to load:', err)
+      } finally {
+        setLoading(false)
+      }
     }
     load()
   }, [])

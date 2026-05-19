@@ -241,19 +241,37 @@ export default function ImportFlow() {
 
     setNoNameSkipped(parsed.rows.length - allRows.length)
 
-    // Fetch existing contacts with all enrichable fields + id
-    const { data: existing, error: fetchErr } = await supabase
-      .from('contacts')
-      .select('id, name, email, phone, linkedin_url, company, role, city')
+    // Fetch ALL existing contacts for deduplication, paging past Supabase's 1,000-row limit.
+    // Without batching, a database with > 1,000 contacts would silently miss some contacts,
+    // causing those to be classified as "new" instead of matches for enrichment.
+    const BATCH_SIZE = 1000
+    const allExisting: ExistingContact[] = []
+    let fetchFrom = 0
+    let fetchErr = null
+
+    while (true) {
+      const { data: batch, error: batchErr } = await supabase
+        .from('contacts')
+        .select('id, name, email, phone, linkedin_url, company, role, city')
+        .range(fetchFrom, fetchFrom + BATCH_SIZE - 1)
+
+      if (batchErr) { fetchErr = batchErr; break }
+      if (!batch || batch.length === 0) break
+
+      allExisting.push(...(batch as ExistingContact[]))
+
+      if (batch.length < BATCH_SIZE) break
+      fetchFrom += BATCH_SIZE
+    }
 
     if (fetchErr) {
       console.error('[Import] Failed to fetch contacts for dedupe:', fetchErr)
-      setError(`Could not check for duplicates: ${fetchErr.message}`)
+      setError(`Could not check for duplicates: ${(fetchErr as { message: string }).message}`)
       setLoadingReview(false)
       return
     }
 
-    const existingContacts = (existing ?? []) as ExistingContact[]
+    const existingContacts = allExisting
     const dedupeMap    = buildDedupeMap(existingContacts)
     const nameOnlyMap  = buildNameOnlyMap(existingContacts)
     const seenInFile   = new Set<string>()  // grows as rows are processed
