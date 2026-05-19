@@ -10,19 +10,21 @@ import BusinessCardScanner from '@/components/BusinessCardScanner'
 export default function NewContactPage() {
   const router = useRouter()
 
-  // prefill holds the last scan result; formKey forces ContactForm to remount
-  // with fresh initial values whenever a scan is applied.
   const [prefill, setPrefill] = useState<Partial<Contact>>({})
   const [formKey, setFormKey] = useState(0)
   const [scannedBanner, setScannedBanner] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
 
   const handleExtract = (fields: Partial<Contact>) => {
     setPrefill(fields)
     setFormKey(k => k + 1)
     setScannedBanner(true)
+    setSaveError(null)
   }
 
   const handleSubmit = async (data: Record<string, string>) => {
+    setSaveError(null)
+
     const cleaned = Object.fromEntries(
       Object.entries(data).map(([k, v]) => [k, v.trim() === '' ? null : v.trim()])
     )
@@ -30,12 +32,21 @@ export default function NewContactPage() {
       ...cleaned,
       familiarity: cleaned.familiarity ? parseInt(cleaned.familiarity as string) : 1,
     }
+
     const { data: contact, error } = await supabase
       .from('contacts')
       .insert(toInsert)
       .select()
       .single()
-    if (!error && contact) {
+
+    if (error) {
+      // Surface the error so the user knows the save failed, and log for debugging
+      console.error('[NewContact] Supabase insert error:', error.code, error.message, error.details)
+      setSaveError(`Could not save contact: ${error.message}`)
+      return
+    }
+
+    if (contact) {
       router.push(`/contacts/${contact.id}`)
     }
   }
@@ -60,12 +71,12 @@ export default function NewContactPage() {
         </div>
       </div>
 
-      {/* Scanner — sits between header and form */}
+      {/* Scanner */}
       <div className="mt-5 mb-6">
         <BusinessCardScanner onExtract={handleExtract} />
       </div>
 
-      {/* Pre-fill banner — shows after a scan is applied */}
+      {/* Pre-fill banner */}
       {scannedBanner && (
         <div className="flex items-center justify-between rounded-xl bg-zinc-100 dark:bg-zinc-800 px-4 py-2.5 mb-5">
           <p className="text-xs text-zinc-500 dark:text-zinc-400">
@@ -85,7 +96,14 @@ export default function NewContactPage() {
         </div>
       )}
 
-      {/* Form — key forces remount when scan is applied */}
+      {/* Save error — shown when Supabase insert fails (e.g. schema mismatch) */}
+      {saveError && (
+        <div className="rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 px-4 py-3 mb-5">
+          <p className="text-sm text-red-600 dark:text-red-400">{saveError}</p>
+        </div>
+      )}
+
+      {/* Form */}
       <ContactForm
         key={formKey}
         initial={prefill}

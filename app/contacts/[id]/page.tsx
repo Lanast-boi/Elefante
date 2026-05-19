@@ -15,6 +15,7 @@ export default function ContactDetailPage() {
   const [contact, setContact] = useState<Contact | null>(null)
   const [notes, setNotes] = useState<Note[]>([])
   const [editing, setEditing] = useState(false)
+  const [editError, setEditError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
 
   // Personal Context
@@ -71,10 +72,12 @@ export default function ContactDetailPage() {
       .single()
 
     if (error) {
-      console.error('Failed to save contact:', error.message)
+      console.error('[EditContact] Supabase update error:', error.code, error.message, error.details)
+      setEditError(`Could not save changes: ${error.message}`)
       return
     }
 
+    setEditError(null)
     setContact(updated)
     setEditing(false)
   }
@@ -146,10 +149,15 @@ export default function ContactDetailPage() {
               Cancel
             </button>
           </div>
+          {editError && (
+            <div className="rounded-xl bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 px-4 py-3 mb-5">
+              <p className="text-sm text-red-600 dark:text-red-400">{editError}</p>
+            </div>
+          )}
           <ContactForm
             initial={contact}
             onSubmit={handleEdit}
-            onCancel={() => setEditing(false)}
+            onCancel={() => { setEditing(false); setEditError(null) }}
             submitLabel="Save Changes"
           />
         </div>

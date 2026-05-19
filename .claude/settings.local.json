@@ -17,7 +17,8 @@
       "Read(//c/Users/labro/OneDrive/Έγγραφά/Claude/Claude Code/**)",
       "Bash(grep -r \"ANTHROPIC\" --include=\"*.ts\" --include=\"*.tsx\" --include=\"*.js\" --include=\"*.env*\" --include=\"*.json\" -l)",
       "Bash(curl -s -X POST https://mvgjzduafzpnlwvryshz.supabase.co/functions/v1/parse-business-card -H 'Authorization: Bearer sb_publishable_wzgtZN69oM-a3hCPbC3sdw_2VKk0XK6' -H 'Content-Type: application/json' -d '{\"rawText\": \"Alvaro Imaz\\\\nDirector General\\\\nMUPRO\\\\nalvaro.imaz@muepro.es\\\\n+34 916 321 755\"}')",
-      "Bash(git checkout *)"
+      "Bash(git checkout *)",
+      "Bash(git restore *)"
     ]
   }
 }
